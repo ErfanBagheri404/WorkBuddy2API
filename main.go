@@ -25,11 +25,50 @@ func main() {
 		}
 	}
 	apiKey := flagValue("--api-key", "WORKBUDDY2API_KEY")
+	optDesensitize = flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "" &&
+		flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "0"
+	optRateLimit = parseInterval(flagValue("--rate-limit", "WORKBUDDY2API_RATE_LIMIT"))
 	if headless {
 		runHeadless(apiKey)
 		return
 	}
 	runInteractive(apiKey)
+}
+
+// optDesensitize / optRateLimit are process-wide flags for anti-block mode.
+var (
+	optDesensitize bool
+	optRateLimit   time.Duration
+)
+
+// parseInterval accepts "2s"/"500ms" or a bare number of seconds.
+// Empty or unparseable input disables the limiter.
+func parseInterval(s string) time.Duration {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// newLimiter builds the rate limiter, or nil when disabled.
+func newLimiter() *RateLimiter {
+	if optRateLimit <= 0 {
+		return nil
+	}
+	rl := NewRateLimiter(optRateLimit)
+	rl.startCleanup()
+	return rl
 }
 
 // flagValue returns the value of --name=value or --name value, falling back
@@ -259,7 +298,7 @@ func startServer(authFile, apiKey string) {
 		return
 	}
 	client := NewUpstreamClient(am)
-	srv := NewServer(client, am, apiKey)
+	srv := NewServer(client, am, apiKey, optDesensitize, newLimiter())
 
 	addr := ":61021"
 	fmt.Printf("  Starting server on http://localhost%s\n", addr)
@@ -291,7 +330,7 @@ func runHeadless(apiKey string) {
 		os.Exit(1)
 	}
 	client := NewUpstreamClient(am)
-	srv := NewServer(client, am, apiKey)
+	srv := NewServer(client, am, apiKey, optDesensitize, newLimiter())
 	addr := ":61021"
 	fmt.Printf("WorkBuddy2API listening on http://localhost%s\n", addr)
 	if apiKey != "" {

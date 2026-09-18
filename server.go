@@ -12,13 +12,15 @@ import (
 
 // Server exposes OpenAI-compatible endpoints.
 type Server struct {
-	client *UpstreamClient
-	auth   *AuthManager
-	apiKey string
+	client      *UpstreamClient
+	auth        *AuthManager
+	apiKey      string
+	desensitize bool
+	limiter     *RateLimiter
 }
 
-func NewServer(client *UpstreamClient, am *AuthManager, apiKey string) *Server {
-	return &Server{client: client, auth: am, apiKey: apiKey}
+func NewServer(client *UpstreamClient, am *AuthManager, apiKey string, desensitize bool, limiter *RateLimiter) *Server {
+	return &Server{client: client, auth: am, apiKey: apiKey, desensitize: desensitize, limiter: limiter}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -29,6 +31,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown endpoint", "not_found")
 	})
+	if s.limiter != nil {
+		return s.limiter.middleware(mux)
+	}
 	return mux
 }
 
@@ -120,6 +125,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	_ = json.Unmarshal(body, &payload)
 	payload["stream"] = true
+
+	// Desensitize mode: rewrite moderation-triggering keywords in the system
+	// prompt so upstream safety review does not reject otherwise-fine requests.
+	if s.desensitize {
+		if msgs, ok := payload["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok {
+				if first["role"] == "system" {
+					if content, ok := first["content"].(string); ok {
+						first["content"] = desensitizePrompt(content)
+					}
+				}
+			}
+		}
+	}
+
 	body, _ = json.Marshal(payload)
 
 	resp, err := s.client.Chat(body)
