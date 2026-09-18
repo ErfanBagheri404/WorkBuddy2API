@@ -115,11 +115,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect all SSE chunks into a single non-stream response.
-	var (
+	// Each upstream choice gets its own accumulator keyed by choice index.
+	type choiceAcc struct {
 		collected []string
-		id        string
-		model     string
+		toolCalls []assembledToolCall
 		finish    string
+	}
+	accByIndex := map[int]*choiceAcc{}
+	var (
+		id    string
+		model string
 	)
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
@@ -137,7 +142,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Choices []struct {
 				Index int `json:"index"`
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    *int   `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -152,32 +166,81 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			model = chunk.Model
 		}
 		for _, c := range chunk.Choices {
+			acc, ok := accByIndex[c.Index]
+			if !ok {
+				acc = &choiceAcc{}
+				accByIndex[c.Index] = acc
+			}
 			if c.Delta.Content != "" {
-				collected = append(collected, c.Delta.Content)
+				acc.collected = append(acc.collected, c.Delta.Content)
+			}
+			for _, tc := range c.Delta.ToolCalls {
+				idx := len(acc.toolCalls)
+				if tc.Index != nil {
+					idx = *tc.Index
+				}
+				if idx < 0 {
+					continue
+				}
+				for len(acc.toolCalls) <= idx {
+					acc.toolCalls = append(acc.toolCalls, assembledToolCall{Type: "function"})
+				}
+				if tc.ID != "" {
+					acc.toolCalls[idx].ID = tc.ID
+				}
+				if tc.Type != "" {
+					acc.toolCalls[idx].Type = tc.Type
+				}
+				if tc.Function.Name != "" {
+					acc.toolCalls[idx].Function.Name = tc.Function.Name
+				}
+				acc.toolCalls[idx].Function.Arguments += tc.Function.Arguments
 			}
 			if c.FinishReason != nil {
-				finish = *c.FinishReason
+				acc.finish = *c.FinishReason
 			}
 		}
 	}
-	content := strings.Join(collected, "")
-	if finish == "" {
-		finish = "stop"
+	// Emit one response choice per upstream choice.
+	choices := make([]map[string]any, 0, len(accByIndex))
+	for idx, acc := range accByIndex {
+		if acc.finish == "" {
+			acc.finish = "stop"
+		}
+		message := map[string]any{
+			"role":    "assistant",
+			"content": strings.Join(acc.collected, ""),
+		}
+		if len(acc.toolCalls) > 0 {
+			message["tool_calls"] = acc.toolCalls
+			if acc.finish == "stop" {
+				acc.finish = "tool_calls"
+			}
+		}
+		choices = append(choices, map[string]any{
+			"index":         idx,
+			"message":       message,
+			"finish_reason": acc.finish,
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"model":   model,
-		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": content,
-			},
-			"finish_reason": finish,
-		}},
+		"choices": choices,
 	})
+}
+
+// assembledToolCall is the non-streaming form of a tool call rebuilt from
+// streamed deltas.
+type assembledToolCall struct {
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 func writeError(w http.ResponseWriter, status int, msg, typ string) {
