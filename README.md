@@ -51,7 +51,7 @@ WorkBuddy2API.exe
 WorkBuddy2API.exe --headless
 
 # protect /v1 endpoints with a bearer token
-WorkBuddy2API.exe --headless --api-key=YOUR_SECRET
+WorkBuddy2API.exe --headless --api-key="$MY_PROXY_KEY"
 
 # enable per-IP rate limiting (2-second minimum interval with ±20% jitter)
 WorkBuddy2API.exe --headless --rate-limit=2s
@@ -60,7 +60,7 @@ WorkBuddy2API.exe --headless --rate-limit=2s
 WorkBuddy2API.exe --headless --desensitize
 
 # combine all three
-WorkBuddy2API.exe --headless --api-key=YOUR_SECRET --rate-limit=2s --desensitize
+WorkBuddy2API.exe --headless --api-key="$MY_PROXY_KEY" --rate-limit=2s --desensitize
 ```
 
 | Flag                | Env variable            | Default | Description                                           |
@@ -120,10 +120,10 @@ probes keep working.
 
 ```bash
 curl http://localhost:61021/v1/models \
-  -H "Authorization: Bearer YOUR_SECRET"
+  -H "Authorization: Bearer $MY_PROXY_KEY"
 ```
 
-`x-api-key: YOUR_SECRET` is accepted as an alternative. The scheme name is
+The `x-api-key` header is accepted as an alternative. The scheme name is
 case-insensitive (`bearer`, `Bearer`, `BEARER` all work), and comparison is
 constant-time.
 
@@ -133,13 +133,14 @@ is served — the original localhost-only behaviour.
 ### OpenAI SDK
 
 ```python
+import os
 from openai import OpenAI
 
 # no --api-key configured: any placeholder works
 client = OpenAI(base_url="http://localhost:61021/v1", api_key="unused")
 
-# --api-key=YOUR_SECRET configured: the SDK's api_key is sent as the bearer token
-client = OpenAI(base_url="http://localhost:61021/v1", api_key="YOUR_SECRET")
+# with --api-key set: the SDK sends its api_key as the bearer token
+client = OpenAI(base_url="http://localhost:61021/v1", api_key=os.environ["MY_PROXY_KEY"])
 
 resp = client.chat.completions.create(
     model="default-model",
