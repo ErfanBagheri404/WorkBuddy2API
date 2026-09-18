@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -16,19 +17,43 @@ type Server struct {
 	apiKey string
 }
 
-func NewServer(client *UpstreamClient, am *AuthManager) *Server {
-	return &Server{client: client, auth: am}
+func NewServer(client *UpstreamClient, am *AuthManager, apiKey string) *Server {
+	return &Server{client: client, auth: am, apiKey: apiKey}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	mux.HandleFunc("/v1/models", s.requireAPIKey(s.handleModels))
+	mux.HandleFunc("/v1/chat/completions", s.requireAPIKey(s.handleChat))
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown endpoint", "not_found")
 	})
 	return mux
+}
+
+// requireAPIKey enforces bearer-token auth when a key is configured.
+// When no key is set the handler is called directly, preserving the
+// original unauthenticated localhost-only behaviour.
+func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" {
+			next(w, r)
+			return
+		}
+		provided := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			provided = strings.TrimPrefix(h, "Bearer ")
+		} else if k := r.Header.Get("x-api-key"); k != "" {
+			provided = k
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
+			writeError(w, http.StatusUnauthorized,
+				"invalid API key", "invalid_request_error")
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
