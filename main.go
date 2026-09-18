@@ -40,7 +40,7 @@ func flagValue(name, env string) string {
 		if strings.HasPrefix(arg, name+"=") {
 			return strings.TrimPrefix(arg, name+"=")
 		}
-		if arg == name && i+1 < len(args) {
+		if arg == name && i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
 			return args[i+1]
 		}
 	}

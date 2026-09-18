@@ -49,7 +49,25 @@ WorkBuddy2API.exe
 
 # server only (requires a prior login)
 WorkBuddy2API.exe --headless
+
+# protect /v1 endpoints with a bearer token
+WorkBuddy2API.exe --headless --api-key=YOUR_SECRET
+
+# enable per-IP rate limiting (2-second minimum interval with ±20% jitter)
+WorkBuddy2API.exe --headless --rate-limit=2s
+
+# rewrite system-prompt keywords that trigger content moderation
+WorkBuddy2API.exe --headless --desensitize
+
+# combine all three
+WorkBuddy2API.exe --headless --api-key=YOUR_SECRET --rate-limit=2s --desensitize
 ```
+
+| Flag                | Env variable            | Default | Description                                           |
+| ------------------- | ----------------------- | ------- | ----------------------------------------------------- |
+| `--api-key=...`     | `WORKBUDDY2API_KEY`     | *none*  | Require `Authorization: Bearer <key>` on `/v1` routes |
+| `--rate-limit=...`  | `WORKBUDDY2API_RATE_LIMIT` | *off* | Min interval per IP (`2s`, `500`, `500ms`)          |
+| `--desensitize`     | `WORKBUDDY2API_DESENSITIZE` | *off* | Rewrite moderation-triggering system-prompt keywords  |
 
 Menu options:
 
@@ -94,12 +112,34 @@ curl -N http://localhost:61021/v1/chat/completions \
   }'
 ```
 
+### Authentication
+
+When `--api-key` (or `WORKBUDDY2API_KEY`) is set, `/v1/models` and
+`/v1/chat/completions` require a credential. `/healthz` stays open so liveness
+probes keep working.
+
+```bash
+curl http://localhost:61021/v1/models \
+  -H "Authorization: Bearer YOUR_SECRET"
+```
+
+`x-api-key: YOUR_SECRET` is accepted as an alternative. The scheme name is
+case-insensitive (`bearer`, `Bearer`, `BEARER` all work), and comparison is
+constant-time.
+
+With no key configured, authentication is disabled entirely and every request
+is served — the original localhost-only behaviour.
+
 ### OpenAI SDK
 
 ```python
 from openai import OpenAI
 
+# no --api-key configured: any placeholder works
 client = OpenAI(base_url="http://localhost:61021/v1", api_key="unused")
+
+# --api-key=YOUR_SECRET configured: the SDK's api_key is sent as the bearer token
+client = OpenAI(base_url="http://localhost:61021/v1", api_key="YOUR_SECRET")
 
 resp = client.chat.completions.create(
     model="default-model",
@@ -108,8 +148,9 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> The `api_key` value is ignored — WorkBuddy authentication comes from the
-> tokens saved during login.
+> WorkBuddy's own authentication comes from the tokens saved during login, not
+> from the SDK `api_key`. When you pass `--api-key`, that value doubles as the
+> proxy's bearer token.
 
 ## How it works
 

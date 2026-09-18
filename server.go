@@ -23,37 +23,49 @@ func NewServer(client *UpstreamClient, am *AuthManager, apiKey string) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", s.requireAPIKey(s.handleModels))
-	mux.HandleFunc("/v1/chat/completions", s.requireAPIKey(s.handleChat))
+	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/chat/completions", s.handleChat)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown endpoint", "not_found")
 	})
-	return mux
+	// Auth applies to the whole /v1/ space so an unknown /v1/* path 401s
+	// rather than leaking 404 to unauthenticated callers.
+	return s.requireAPIKey(mux)
 }
 
-// requireAPIKey enforces bearer-token auth when a key is configured.
-// When no key is set the handler is called directly, preserving the
-// original unauthenticated localhost-only behaviour.
-func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.apiKey == "" {
-			next(w, r)
+// requireAPIKey enforces bearer-token auth on the /v1/ route space when a key
+// is configured. Paths outside /v1/ (notably /healthz) stay open, and when no
+// key is set every request passes through, preserving the original
+// unauthenticated localhost-only behaviour.
+//
+// Credentials are accepted as `Authorization: Bearer <key>` or `x-api-key`.
+// The auth scheme is case-insensitive per RFC 9110 and comparison is
+// constant-time. When both headers are present, a well-formed Bearer value
+// wins; otherwise the x-api-key header is consulted.
+func (s *Server) requireAPIKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" || !strings.HasPrefix(r.URL.Path, "/v1/") {
+			next.ServeHTTP(w, r)
 			return
 		}
 		provided := ""
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			provided = strings.TrimPrefix(h, "Bearer ")
-		} else if k := r.Header.Get("x-api-key"); k != "" {
-			provided = k
+		if h := r.Header.Get("Authorization"); h != "" {
+			scheme, rest, ok := strings.Cut(h, " ")
+			if ok && strings.EqualFold(scheme, "Bearer") {
+				provided = strings.TrimLeft(rest, " ")
+			}
+		}
+		if provided == "" {
+			provided = r.Header.Get("x-api-key")
 		}
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
 			writeError(w, http.StatusUnauthorized,
 				"invalid API key", "invalid_request_error")
 			return
 		}
-		next(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
