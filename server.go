@@ -117,6 +117,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Collect all SSE chunks into a single non-stream response.
 	var (
 		collected []string
+		toolCalls []assembledToolCall
 		id        string
 		model     string
 		finish    string
@@ -137,7 +138,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Choices []struct {
 				Index int `json:"index"`
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    *int   `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -155,6 +165,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if c.Delta.Content != "" {
 				collected = append(collected, c.Delta.Content)
 			}
+			for _, tc := range c.Delta.ToolCalls {
+				idx := len(toolCalls)
+				if tc.Index != nil {
+					idx = *tc.Index
+				}
+				for len(toolCalls) <= idx {
+					toolCalls = append(toolCalls, assembledToolCall{Type: "function"})
+				}
+				if tc.ID != "" {
+					toolCalls[idx].ID = tc.ID
+				}
+				if tc.Type != "" {
+					toolCalls[idx].Type = tc.Type
+				}
+				if tc.Function.Name != "" {
+					toolCalls[idx].Function.Name = tc.Function.Name
+				}
+				toolCalls[idx].Function.Arguments += tc.Function.Arguments
+			}
 			if c.FinishReason != nil {
 				finish = *c.FinishReason
 			}
@@ -164,20 +193,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if finish == "" {
 		finish = "stop"
 	}
+	message := map[string]any{
+		"role":    "assistant",
+		"content": content,
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+		if finish == "stop" {
+			finish = "tool_calls"
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"model":   model,
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": content,
-			},
+			"index":         0,
+			"message":       message,
 			"finish_reason": finish,
 		}},
 	})
+}
+
+// assembledToolCall is the non-streaming form of a tool call rebuilt from
+// streamed deltas.
+type assembledToolCall struct {
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 func writeError(w http.ResponseWriter, status int, msg, typ string) {
