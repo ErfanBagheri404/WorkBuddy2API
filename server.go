@@ -117,6 +117,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// When the client wants non-streaming, buffer the SSE chunks and return
 	// a single assembled JSON response.
 	clientWantsStream := probe.Stream == nil || *probe.Stream
+
+	cid := newCorrelationID()
+	started := time.Now()
+	model, _, msgCount, lastUser := summariseRequest(body)
+	logLine(cid, "▶ REQUEST %s | stream=%v | msgs=%d | last_user=%q",
+		model, clientWantsStream, msgCount, lastUser)
+	logBlock(cid, "REQUEST BODY", string(body))
+
 	var payload map[string]any
 	_ = json.Unmarshal(body, &payload)
 	payload["stream"] = true
@@ -124,18 +132,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Chat(body)
 	if err != nil {
+		logLine(cid, "✗ UPSTREAM ERROR %s | %s", model, err)
 		writeError(w, http.StatusBadGateway, "upstream: "+err.Error(), "server_error")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		copyBody(w, resp, resp.StatusCode)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		logLine(cid, "✗ UPSTREAM HTTP %d | %s", resp.StatusCode, redact(string(errBody)))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(errBody)
 		return
 	}
 
 	if clientWantsStream {
-		copySSE(w, resp)
+		copySSELogged(w, resp, cid, model, started)
 		return
 	}
 
@@ -143,7 +156,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var (
 		collected []string
 		id        string
-		model     string
 		finish    string
 	)
 	scanner := bufio.NewScanner(resp.Body)
@@ -189,8 +201,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if finish == "" {
 		finish = "stop"
 	}
+	logLine(cid, "◀ RESPONSE %s | %.1fs | finish=%s | chars=%d",
+		model, time.Since(started).Seconds(), finish, len(content))
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	respPayload := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"model":   model,
@@ -202,7 +216,83 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			},
 			"finish_reason": finish,
 		}},
-	})
+	}
+	if out, err := json.Marshal(respPayload); err == nil {
+		logBlock(cid, "RESPONSE BODY", string(out))
+	}
+	json.NewEncoder(w).Encode(respPayload)
+}
+
+// copySSELogged streams SSE to the client while capturing the raw upstream
+// stream for the trace file.
+func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, model string, started time.Time) {
+	var raw strings.Builder
+	finish := ""
+	chars := 0
+
+	dst.Header().Set("Content-Type", "text/event-stream")
+	dst.Header().Set("Cache-Control", "no-cache")
+	dst.Header().Set("Connection", "keep-alive")
+	flusher, _ := dst.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Body.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			dst.Write(chunk)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if LoggingEnabled() {
+				raw.Write(chunk)
+				chars += n
+				finish = lastFinishReason(chunk, finish)
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if LoggingEnabled() {
+		logLine(cid, "◀ RESPONSE %s | %.1fs | finish=%s | bytes=%d (streamed)",
+			model, time.Since(started).Seconds(), orDefault(finish, "stop"), chars)
+		logBlock(cid, "RESPONSE RAW SSE", raw.String())
+	}
+}
+
+// lastFinishReason extracts finish_reason from an SSE chunk if present.
+func lastFinishReason(chunk []byte, current string) string {
+	for _, line := range strings.Split(string(chunk), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			continue
+		}
+		var c struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &c) != nil {
+			continue
+		}
+		for _, ch := range c.Choices {
+			if ch.FinishReason != nil && *ch.FinishReason != "" {
+				current = *ch.FinishReason
+			}
+		}
+	}
+	return current
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 func writeError(w http.ResponseWriter, status int, msg, typ string) {

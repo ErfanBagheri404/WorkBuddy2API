@@ -25,6 +25,10 @@ func main() {
 		}
 	}
 	apiKey := flagValue("--api-key", "WORKBUDDY2API_KEY")
+	logPath := flagValue("--log", "WORKBUDDY2API_LOG")
+	if err := EnableLogging(logPath); err != nil {
+		fmt.Fprintf(os.Stderr, "logging disabled: %v\n", err)
+	}
 	if headless {
 		runHeadless(apiKey)
 		return
