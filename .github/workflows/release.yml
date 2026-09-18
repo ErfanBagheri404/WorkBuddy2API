@@ -1,30 +1,72 @@
 name: Release
 
-# Cut a release by pushing a tag:  git tag v0.2.0 && git push origin v0.2.0
+# Every push to main bumps the patch version, tags it, builds the exe and
+# publishes a GitHub Release — no manual tagging needed.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths-ignore:
+      - "VERSION"        # the version-bump commit this workflow makes
+      - "*.md"
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: stable
 
-      - name: Build
-        run: go build -ldflags "-X main.Version=${{ github.ref_name }}" -o WorkBuddy2API.exe .
+      - name: Bump patch version
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          current="$(tr -d '[:space:]' < VERSION)"
+          IFS='.' read -r major minor patch <<< "$current"
+          next="${major}.${minor}.$((patch + 1))"
+          echo "$next" > VERSION
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "Bumped $current -> $next"
 
-      - name: Release
+      - name: Build
+        shell: bash
+        run: |
+          go build -ldflags "-X main.Version=v${{ steps.bump.outputs.version }}" -o WorkBuddy2API.exe .
+
+      - name: Commit version bump
+        shell: bash
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: release v${{ steps.bump.outputs.version }} [skip ci]"
+          git push
+
+      - name: Tag
+        shell: bash
+        run: |
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin "v${{ steps.bump.outputs.version }}"
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: "v${{ steps.bump.outputs.version }}"
+          name: "v${{ steps.bump.outputs.version }}"
           files: WorkBuddy2API.exe
           generate_release_notes: true
+          make_latest: true
