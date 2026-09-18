@@ -136,11 +136,13 @@ is served — the original localhost-only behaviour.
 import os
 from openai import OpenAI
 
-# no --api-key configured: any placeholder works
-client = OpenAI(base_url="http://localhost:61021/v1", api_key="unused")
-
-# with --api-key set: the SDK sends its api_key as the bearer token
-client = OpenAI(base_url="http://localhost:61021/v1", api_key=os.environ["MY_PROXY_KEY"])
+# No --api-key configured: the value is unused, any placeholder will do.
+# With --api-key set: pass the same value here so the SDK sends it as
+# the bearer token.
+client = OpenAI(
+    base_url="http://localhost:61021/v1",
+    api_key=os.environ.get("WORKBUDDY2API_KEY", "not-needed"),
+)
 
 resp = client.chat.completions.create(
     model="default-model",
