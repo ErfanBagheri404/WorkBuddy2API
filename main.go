@@ -13,16 +13,41 @@ import (
 )
 
 func main() {
+	var headless bool
 	for _, arg := range os.Args[1:] {
-		if arg == "--headless" {
-			runHeadless()
-			return
+		switch {
+		case arg == "--headless":
+			headless = true
+		case arg == "--api-key":
+			// handled by flagValue below
+		case strings.HasPrefix(arg, "--api-key="):
+			// handled by flagValue below
 		}
 	}
-	runInteractive()
+	apiKey := flagValue("--api-key", "WORKBUDDY2API_KEY")
+	if headless {
+		runHeadless(apiKey)
+		return
+	}
+	runInteractive(apiKey)
 }
 
-func runInteractive() {
+// flagValue returns the value of --name=value or --name value, falling back
+// to the given environment variable.
+func flagValue(name, env string) string {
+	args := os.Args[1:]
+	for i, arg := range args {
+		if strings.HasPrefix(arg, name+"=") {
+			return strings.TrimPrefix(arg, name+"=")
+		}
+		if arg == name && i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+			return args[i+1]
+		}
+	}
+	return os.Getenv(env)
+}
+
+func runInteractive(apiKey string) {
 	printBanner()
 
 	authFile := defaultAuthPath()
@@ -49,7 +74,7 @@ func runInteractive() {
 		case 1:
 			showStatus(authFile)
 		case 2:
-			startServer(authFile)
+			startServer(authFile, apiKey)
 		case 3:
 			showModels(authFile)
 		case 4:
@@ -226,7 +251,7 @@ func testChat(authFile string) {
 	fmt.Println()
 }
 
-func startServer(authFile string) {
+func startServer(authFile, apiKey string) {
 	fmt.Println()
 	am, err := LoadAuthManager(authFile)
 	if err != nil {
@@ -234,10 +259,15 @@ func startServer(authFile string) {
 		return
 	}
 	client := NewUpstreamClient(am)
-	srv := NewServer(client, am)
+	srv := NewServer(client, am, apiKey)
 
 	addr := ":61021"
 	fmt.Printf("  Starting server on http://localhost%s\n", addr)
+	if apiKey != "" {
+		fmt.Println("  API key auth: ENABLED (Authorization: Bearer <key>)")
+	} else {
+		fmt.Println("  API key auth: disabled (localhost only)")
+	}
 	fmt.Println()
 	fmt.Println("  Endpoints:")
 	fmt.Printf("    GET  http://localhost%s/healthz\n", addr)
@@ -253,7 +283,7 @@ func startServer(authFile string) {
 	}
 }
 
-func runHeadless() {
+func runHeadless(apiKey string) {
 	authFile := defaultAuthPath()
 	am, err := LoadAuthManager(authFile)
 	if err != nil {
@@ -261,9 +291,12 @@ func runHeadless() {
 		os.Exit(1)
 	}
 	client := NewUpstreamClient(am)
-	srv := NewServer(client, am)
+	srv := NewServer(client, am, apiKey)
 	addr := ":61021"
 	fmt.Printf("WorkBuddy2API listening on http://localhost%s\n", addr)
+	if apiKey != "" {
+		fmt.Println("API key auth enabled")
+	}
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
