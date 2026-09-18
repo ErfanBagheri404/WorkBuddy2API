@@ -25,40 +25,54 @@ func NewServer(client *UpstreamClient, am *AuthManager, apiKey string, desensiti
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", s.requireAPIKey(s.handleModels))
-	mux.HandleFunc("/v1/chat/completions", s.requireAPIKey(s.handleChat))
+	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/chat/completions", s.handleChat)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown endpoint", "not_found")
 	})
+	// Auth applies to the whole /v1/ space so an unknown /v1/* path 401s
+	// rather than leaking 404 to unauthenticated callers.
+	var h http.Handler = mux
+	h = s.requireAPIKey(h)
 	if s.limiter != nil {
-		return s.limiter.middleware(mux)
+		h = s.limiter.middleware(h)
 	}
-	return mux
+	return h
 }
 
-// requireAPIKey enforces bearer-token auth when a key is configured.
-// When no key is set the handler is called directly, preserving the
-// original unauthenticated localhost-only behaviour.
-func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.apiKey == "" {
-			next(w, r)
+// requireAPIKey enforces bearer-token auth on the /v1/ route space when a key
+// is configured. Paths outside /v1/ (notably /healthz) stay open, and when no
+// key is set every request passes through, preserving the original
+// unauthenticated localhost-only behaviour.
+//
+// Credentials are accepted as `Authorization: Bearer <key>` or `x-api-key`.
+// The auth scheme is case-insensitive per RFC 9110 and comparison is
+// constant-time. When both headers are present, a well-formed Bearer value
+// wins; otherwise the x-api-key header is consulted.
+func (s *Server) requireAPIKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" || !strings.HasPrefix(r.URL.Path, "/v1/") {
+			next.ServeHTTP(w, r)
 			return
 		}
 		provided := ""
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			provided = strings.TrimPrefix(h, "Bearer ")
-		} else if k := r.Header.Get("x-api-key"); k != "" {
-			provided = k
+		if h := r.Header.Get("Authorization"); h != "" {
+			scheme, rest, ok := strings.Cut(h, " ")
+			if ok && strings.EqualFold(scheme, "Bearer") {
+				provided = strings.TrimLeft(rest, " ")
+			}
+		}
+		if provided == "" {
+			provided = r.Header.Get("x-api-key")
 		}
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
 			writeError(w, http.StatusUnauthorized,
 				"invalid API key", "invalid_request_error")
 			return
 		}
-		next(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -118,9 +132,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "messages must not be empty", "invalid_request_error")
 		return
 	}
-	// WorkBuddy only supports streaming. Always request stream from upstream.
-	// When the client wants non-streaming, buffer the SSE chunks and return
-	// a single assembled JSON response.
 	clientWantsStream := probe.Stream == nil || *probe.Stream
 	var payload map[string]any
 	_ = json.Unmarshal(body, &payload)
@@ -128,12 +139,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Desensitize mode: rewrite moderation-triggering keywords in the system
 	// prompt so upstream safety review does not reject otherwise-fine requests.
+	// Rewrites are word-boundary-aware and cover every table entry, so no
+	// separate pre-check is needed.
 	if s.desensitize {
 		if msgs, ok := payload["messages"].([]any); ok && len(msgs) > 0 {
 			if first, ok := msgs[0].(map[string]any); ok {
 				if first["role"] == "system" {
 					if content, ok := first["content"].(string); ok {
-						first["content"] = desensitizePrompt(content)
+						if rewritten, changed := desensitizePrompt(content); changed {
+							first["content"] = rewritten
+						}
 					}
 				}
 			}
@@ -159,7 +174,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collect all SSE chunks into a single non-stream response.
 	var (
 		collected []string
 		id        string
