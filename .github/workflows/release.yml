@@ -1,12 +1,12 @@
 name: Release
 
 # Every push to main bumps the patch version, tags it, builds the exe and
-# publishes a GitHub Release — no manual tagging needed.
+# publishes a GitHub Release with the commit log as release notes.
 on:
   push:
     branches: [main]
     paths-ignore:
-      - "VERSION"        # the version-bump commit this workflow makes
+      - "VERSION"
       - "*.md"
 
 permissions:
@@ -44,8 +44,28 @@ jobs:
 
       - name: Build
         shell: bash
+        run: go build -ldflags "-X main.Version=v${{ steps.bump.outputs.version }}" -o WorkBuddy2API.exe .
+
+      - name: Build release notes
+        shell: bash
         run: |
-          go build -ldflags "-X main.Version=v${{ steps.bump.outputs.version }}" -o WorkBuddy2API.exe .
+          set -euo pipefail
+          prev="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          {
+            echo "## What changed"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --pretty=format:"- %s (%h)" "${prev}..HEAD"
+            else
+              git log --no-merges --pretty=format:"- %s (%h)" HEAD
+            fi
+            echo
+            echo
+            echo "## Install"
+            echo
+            echo "Download \`WorkBuddy2API.exe\` below and run it."
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
 
       - name: Commit version bump
         shell: bash
@@ -67,6 +87,6 @@ jobs:
         with:
           tag_name: "v${{ steps.bump.outputs.version }}"
           name: "v${{ steps.bump.outputs.version }}"
+          body_path: RELEASE_NOTES.md
           files: WorkBuddy2API.exe
-          generate_release_notes: true
           make_latest: true
