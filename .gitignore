@@ -1,0 +1,30 @@
+# Binaries and build output
+*.exe
+*.dll
+*.so
+*.dylib
+WorkBuddy2API
+/dist/
+
+# Editor / tool backups
+*~
+*.swp
+*.swo
+
+# Auth credentials — NEVER commit these
+.workbuddy2api-auth.json
+workbuddy-auth.json
+*-auth.json
+*.info
+
+# Go
+/vendor/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
