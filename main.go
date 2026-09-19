@@ -28,6 +28,7 @@ func main() {
 	optDesensitize = boolFlag("--desensitize", "WORKBUDDY2API_DESENSITIZE")
 	optRateLimit = parseInterval(flagValue("--rate-limit", "WORKBUDDY2API_RATE_LIMIT"))
 	forceImport = boolFlag("--import-creds", "WORKBUDDY2API_IMPORT_CREDS")
+	optAccount = flagValue("--account", "WORKBUDDY2API_ACCOUNT")
 	if err := EnableLogging(flagValue("--log", "WORKBUDDY2API_LOG")); err != nil {
 		fmt.Fprintf(os.Stderr, "logging disabled: %v\n", err)
 	}
@@ -50,11 +51,12 @@ func main() {
 	runInteractive(apiKey)
 }
 
-// optDesensitize / optRateLimit / forceImport are process-wide flags.
+// optDesensitize / optRateLimit / forceImport / optAccount are process-wide flags.
 var (
 	optDesensitize bool
 	optRateLimit   time.Duration
 	forceImport    bool
+	optAccount     string
 )
 
 // parseInterval accepts "2s"/"500ms" or a bare number of seconds.
@@ -373,14 +375,34 @@ func testChat(authFile string) {
 	fmt.Println()
 }
 
+// newClientForAuth builds the upstream client for a server run. When multiple
+// account files exist under ~/.workbuddy2api/accounts/, it returns a
+// pool-backed client with round-robin selection and quota failover; otherwise
+// it falls back to the single-account client.
+func newClientForAuth(authFile string) (*UpstreamClient, *AuthManager, error) {
+	pool, perr := LoadAccountPool(optAccount)
+	if perr == nil && pool.Count() > 1 {
+		fmt.Printf("  Accounts: %d (%s)\n", pool.Count(), strings.Join(pool.All(), ", "))
+		if optAccount != "" {
+			fmt.Printf("  Pinned to: %s\n", optAccount)
+		}
+		am := pool.Peek()
+		return NewUpstreamClientPool(pool), am, nil
+	}
+	am, err := LoadAuthManager(authFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return NewUpstreamClient(am), am, nil
+}
+
 func startServer(authFile, apiKey string) {
 	fmt.Println()
-	am, err := LoadAuthManager(authFile)
+	client, am, err := newClientForAuth(authFile)
 	if err != nil {
 		fmt.Printf("  ✗ Auth error: %v\n\n", err)
 		return
 	}
-	client := NewUpstreamClient(am)
 	srv := NewServer(client, am, apiKey, optDesensitize, newLimiter())
 
 	addr := ":61021"
