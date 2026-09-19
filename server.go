@@ -12,13 +12,15 @@ import (
 
 // Server exposes OpenAI-compatible endpoints.
 type Server struct {
-	client *UpstreamClient
-	auth   *AuthManager
-	apiKey string
+	client      *UpstreamClient
+	auth        *AuthManager
+	apiKey      string
+	desensitize bool
+	limiter     *RateLimiter
 }
 
-func NewServer(client *UpstreamClient, am *AuthManager, apiKey string) *Server {
-	return &Server{client: client, auth: am, apiKey: apiKey}
+func NewServer(client *UpstreamClient, am *AuthManager, apiKey string, desensitize bool, limiter *RateLimiter) *Server {
+	return &Server{client: client, auth: am, apiKey: apiKey, desensitize: desensitize, limiter: limiter}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -31,7 +33,11 @@ func (s *Server) Handler() http.Handler {
 	})
 	// Auth applies to the whole /v1/ space so an unknown /v1/* path 401s
 	// rather than leaking 404 to unauthenticated callers.
-	return s.requireAPIKey(mux)
+	var h http.Handler = s.requireAPIKey(mux)
+	if s.limiter != nil {
+		h = s.limiter.middleware(h)
+	}
+	return h
 }
 
 // requireAPIKey enforces bearer-token auth on the /v1/ route space when a key
@@ -132,6 +138,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	_ = json.Unmarshal(body, &payload)
 	payload["stream"] = true
+
+	// Desensitize mode: rewrite moderation-triggering keywords in the system
+	// prompt so upstream safety review does not reject otherwise-fine requests.
+	// Rewrites are word-boundary-aware and cover every table entry, so no
+	// separate pre-check is needed. Role is matched case-insensitively to
+	// mirror UpstreamClient.Chat.
+	if s.desensitize {
+		if msgs, ok := payload["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok {
+				if role, ok := first["role"].(string); ok && strings.EqualFold(strings.TrimSpace(role), "system") {
+					if content, ok := first["content"].(string); ok {
+						if rewritten, changed := desensitizePrompt(content); changed {
+							first["content"] = rewritten
+						}
+					}
+				}
+			}
+		}
+	}
 	body, _ = json.Marshal(payload)
 
 	resp, err := s.client.Chat(body)
