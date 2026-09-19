@@ -181,7 +181,19 @@ func desktopCredentialPaths() []string {
 			out = append(out, stable)
 		}
 		matches, _ := filepath.Glob(filepath.Join(dir, "workbuddy-desktop-ai.*.info"))
-		sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+		// Newest snapshot first, by modification time rather than by filename:
+		// timestamped names are not guaranteed to sort chronologically.
+		sort.SliceStable(matches, func(i, j int) bool {
+			fi, err := os.Stat(matches[i])
+			if err != nil {
+				return false
+			}
+			fj, err := os.Stat(matches[j])
+			if err != nil {
+				return true
+			}
+			return fi.ModTime().After(fj.ModTime())
+		})
 		out = append(out, matches...)
 	}
 	return out

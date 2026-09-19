@@ -32,17 +32,22 @@ func main() {
 	if err := EnableLogging(flagValue("--log", "WORKBUDDY2API_LOG")); err != nil {
 		fmt.Fprintf(os.Stderr, "logging disabled: %v\n", err)
 	}
+	// --import-creds is an init-only operation: import, report, exit. Keeping it
+	// here (and returning) means the import never runs twice and headless mode
+	// never starts a server on the back of an import-only invocation.
 	if forceImport {
 		authFile := defaultAuthPath()
-		if src, err := ImportDesktopCredentials(authFile, true); err != nil {
+		src, err := ImportDesktopCredentials(authFile, true)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "import credentials: %v\n", err)
 			os.Exit(1)
-		} else if src == "" {
+		}
+		if src == "" {
 			fmt.Fprintln(os.Stderr, "no WorkBuddy desktop credentials found")
 			os.Exit(1)
-		} else {
-			fmt.Printf("imported credentials from %s\n", src)
 		}
+		fmt.Printf("imported credentials from %s\n", src)
+		return
 	}
 	if headless {
 		runHeadless(apiKey)
@@ -133,19 +138,9 @@ func runInteractive(apiKey string) {
 
 	authFile := defaultAuthPath()
 
-	// Reuse an existing WorkBuddy desktop sign-in when we have no credentials
-	// of our own, so an installed-and-signed-in desktop app needs no browser
-	// round-trip.
-	if forceImport {
-		if src, err := ImportDesktopCredentials(authFile, true); err != nil {
-			fmt.Fprintf(os.Stderr, "  Import failed: %v\n\n", err)
-		} else if src != "" {
-			fmt.Printf("  Imported credentials from %s\n\n", src)
-		} else {
-			fmt.Println("  No desktop credentials found to import.")
-			fmt.Println()
-		}
-	} else if !hasStoredAuth(authFile) {
+	// --import-creds returns in main(); reaching runInteractive means it is not
+	// set.  When no stored credentials exist, try the desktop app silently.
+	if !hasStoredAuth(authFile) {
 		if src, err := ImportDesktopCredentials(authFile, false); err == nil && src != "" {
 			fmt.Printf("  Imported existing WorkBuddy desktop credentials from\n    %s\n\n", src)
 		}
