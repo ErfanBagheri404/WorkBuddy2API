@@ -25,11 +25,23 @@ func main() {
 		}
 	}
 	apiKey := flagValue("--api-key", "WORKBUDDY2API_KEY")
-	optDesensitize = flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "" &&
-		flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "0"
+	optDesensitize = boolFlag("--desensitize", "WORKBUDDY2API_DESENSITIZE")
 	optRateLimit = parseInterval(flagValue("--rate-limit", "WORKBUDDY2API_RATE_LIMIT"))
+	forceImport = boolFlag("--import-creds", "WORKBUDDY2API_IMPORT_CREDS")
 	if err := EnableLogging(flagValue("--log", "WORKBUDDY2API_LOG")); err != nil {
 		fmt.Fprintf(os.Stderr, "logging disabled: %v\n", err)
+	}
+	if forceImport {
+		authFile := defaultAuthPath()
+		if src, err := ImportDesktopCredentials(authFile, true); err != nil {
+			fmt.Fprintf(os.Stderr, "import credentials: %v\n", err)
+			os.Exit(1)
+		} else if src == "" {
+			fmt.Fprintln(os.Stderr, "no WorkBuddy desktop credentials found")
+			os.Exit(1)
+		} else {
+			fmt.Printf("imported credentials from %s\n", src)
+		}
 	}
 	if headless {
 		runHeadless(apiKey)
@@ -38,10 +50,11 @@ func main() {
 	runInteractive(apiKey)
 }
 
-// optDesensitize / optRateLimit are process-wide flags for anti-block mode.
+// optDesensitize / optRateLimit / forceImport are process-wide flags.
 var (
 	optDesensitize bool
 	optRateLimit   time.Duration
+	forceImport    bool
 )
 
 // parseInterval accepts "2s"/"500ms" or a bare number of seconds.
@@ -74,6 +87,30 @@ func newLimiter() *RateLimiter {
 	return rl
 }
 
+// boolFlag reports whether a valueless switch was passed, or whether the
+// environment variable holds a truthy value. Accepts --name, --name=true, and
+// --name=false so a scripted invocation can explicitly disable it.
+func boolFlag(name, env string) bool {
+	for _, arg := range os.Args[1:] {
+		if arg == name {
+			return true
+		}
+		if v, ok := strings.CutPrefix(arg, name+"="); ok {
+			switch strings.ToLower(v) {
+			case "0", "false", "no":
+				return false
+			default:
+				return true
+			}
+		}
+	}
+	switch strings.ToLower(os.Getenv(env)) {
+	case "", "0", "false", "no":
+		return false
+	}
+	return true
+}
+
 // flagValue returns the value of --name=value or --name value, falling back
 // to the given environment variable.
 func flagValue(name, env string) string {
@@ -93,6 +130,24 @@ func runInteractive(apiKey string) {
 	printBanner()
 
 	authFile := defaultAuthPath()
+
+	// Reuse an existing WorkBuddy desktop sign-in when we have no credentials
+	// of our own, so an installed-and-signed-in desktop app needs no browser
+	// round-trip.
+	if forceImport {
+		if src, err := ImportDesktopCredentials(authFile, true); err != nil {
+			fmt.Fprintf(os.Stderr, "  Import failed: %v\n\n", err)
+		} else if src != "" {
+			fmt.Printf("  Imported credentials from %s\n\n", src)
+		} else {
+			fmt.Println("  No desktop credentials found to import.")
+			fmt.Println()
+		}
+	} else if !hasStoredAuth(authFile) {
+		if src, err := ImportDesktopCredentials(authFile, false); err == nil && src != "" {
+			fmt.Printf("  Imported existing WorkBuddy desktop credentials from\n    %s\n\n", src)
+		}
+	}
 
 	if !hasStoredAuth(authFile) {
 		fmt.Println("  No credentials found.")
@@ -205,21 +260,46 @@ func showModels(authFile string) {
 		fmt.Printf("  ✗ Auth error: %v\n\n", err)
 		return
 	}
-		fmt.Println("  Fetching models from WorkBuddy...")
-		fmt.Println()
-		models, err := GetModels(am)
-		if err != nil {
-			fmt.Printf("  ✗ Fetch failed: %v\n\n", err)
-			return
+	fmt.Println("  Fetching models from WorkBuddy...")
+	fmt.Println()
+	models, err := GetModels(am)
+	if err != nil {
+		fmt.Printf("  ✗ Fetch failed: %v\n\n", err)
+		return
+	}
+	for _, m := range models {
+		def := ""
+		if m.Default {
+			def = " (default)"
 		}
-		for _, m := range models {
-			def := ""
-			if m.Default {
-				def = " (default)"
-			}
-			fmt.Printf("    - %s  %s%s\n", m.ID, m.Name, def)
+		fmt.Printf("    - %s  %s%s\n", m.ID, m.Name, def)
+		if caps := modelCapabilities(m); caps != "" {
+			fmt.Printf("        %s\n", caps)
 		}
-		fmt.Println()
+	}
+	fmt.Println()
+}
+
+// modelCapabilities renders the capability and context-window badges for the
+// CLI model list.
+func modelCapabilities(m CachedModel) string {
+	var parts []string
+	if m.MaxInputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("in=%d", m.MaxInputTokens))
+	}
+	if m.MaxOutputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("out=%d", m.MaxOutputTokens))
+	}
+	if m.SupportsImages {
+		parts = append(parts, "images")
+	}
+	if m.SupportsToolCall {
+		parts = append(parts, "tools")
+	}
+	if m.SupportsReasoning {
+		parts = append(parts, "reasoning")
+	}
+	return strings.Join(parts, " ")
 }
 
 func testChat(authFile string) {

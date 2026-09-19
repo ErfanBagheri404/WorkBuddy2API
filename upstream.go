@@ -10,11 +10,24 @@ import (
 	"time"
 )
 
-// CachedModel holds info from /v2/enterprises/personal/models.
+// CachedModel holds info from /v2/enterprises/personal/models. The capability
+// and context-window fields are passed through to /v1/models so clients can
+// render badges and pick a model by window size.
 type CachedModel struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Default bool   `json:"isDefault"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Default     bool   `json:"isDefault"`
+	Description string `json:"descriptionEn,omitempty"`
+	Vendor      string `json:"vendor,omitempty"`
+
+	MaxInputTokens  int `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+
+	SupportsImages    bool `json:"supportsImages,omitempty"`
+	SupportsToolCall  bool `json:"supportsToolCall,omitempty"`
+	SupportsReasoning bool `json:"supportsReasoning,omitempty"`
+
+	Credits string `json:"credits,omitempty"`
 }
 
 // ModelCache fetches and caches the model list from WorkBuddy.

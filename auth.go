@@ -12,6 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -144,6 +147,79 @@ func defaultAuthPath() string {
 		return "workbuddy-auth.json"
 	}
 	return home + string(os.PathSeparator) + ".workbuddy2api-auth.json"
+}
+
+// desktopCredentialPaths returns the WorkBuddy/CodeBuddy desktop credential
+// files for the current platform, most-preferred first. The desktop app writes
+// the same authData shape we persist, so an already-signed-in install can be
+// imported without a browser round-trip.
+func desktopCredentialPaths() []string {
+	var dirs []string
+	switch runtime.GOOS {
+	case "windows":
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			dirs = append(dirs, filepath.Join(local, "CodeBuddyExtension", "Data", "Public", "auth"))
+		}
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			dirs = append(dirs,
+				filepath.Join(home, "Library", "Application Support", "CodeBuddyExtension", "Data", "Public", "auth"))
+		}
+	default:
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			dirs = append(dirs, filepath.Join(xdg, "CodeBuddyExtension", "Data", "Public", "auth"))
+		} else if home, err := os.UserHomeDir(); err == nil {
+			dirs = append(dirs, filepath.Join(home, ".local", "share", "CodeBuddyExtension", "Data", "Public", "auth"))
+		}
+	}
+
+	var out []string
+	for _, dir := range dirs {
+		// Prefer the stable name; fall back to the newest timestamped snapshot.
+		stable := filepath.Join(dir, "workbuddy-desktop-ai.info")
+		if _, err := os.Stat(stable); err == nil {
+			out = append(out, stable)
+		}
+		matches, _ := filepath.Glob(filepath.Join(dir, "workbuddy-desktop-ai.*.info"))
+		sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+		out = append(out, matches...)
+	}
+	return out
+}
+
+// ImportDesktopCredentials looks for an existing desktop sign-in and copies its
+// tokens to destPath. Returns the source path, or "" when nothing was found.
+// An existing destPath is left untouched unless force is set.
+func ImportDesktopCredentials(destPath string, force bool) (string, error) {
+	if !force {
+		if _, err := os.Stat(destPath); err == nil {
+			return "", nil
+		}
+	}
+	for _, src := range desktopCredentialPaths() {
+		raw, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		var d authData
+		if err := json.Unmarshal(raw, &d); err != nil {
+			continue
+		}
+		if d.Auth.AccessToken == "" || d.Auth.RefreshToken == "" {
+			continue
+		}
+		// Re-marshal into our own shape so we never carry unknown desktop
+		// fields into the proxy's auth file.
+		out, err := json.MarshalIndent(&d, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("encode imported credentials: %w", err)
+		}
+		if err := os.WriteFile(destPath, out, 0600); err != nil {
+			return "", fmt.Errorf("write %s: %w", destPath, err)
+		}
+		return src, nil
+	}
+	return "", nil
 }
 
 // AuthManager holds the WorkBuddy session tokens and refreshes them.

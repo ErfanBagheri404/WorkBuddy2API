@@ -26,6 +26,7 @@ func NewServer(client *UpstreamClient, am *AuthManager, apiKey string, desensiti
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/models/", s.handleModels)   // catches /v1/models/<id>
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -79,9 +80,54 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
+// modelObject is the OpenAI model shape plus the capability fields WorkBuddy
+// advertises. Strict OpenAI clients ignore unknown keys.
+type modelObject struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Vendor      string `json:"vendor,omitempty"`
+
+	MaxInputTokens  int `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+
+	SupportsImages    bool `json:"supports_images,omitempty"`
+	SupportsToolCall  bool `json:"supports_tool_calls,omitempty"`
+	SupportsReasoning bool `json:"supports_reasoning,omitempty"`
+
+	Credits string `json:"credits,omitempty"`
+}
+
+func toModelObject(m CachedModel, now int64) modelObject {
+	return modelObject{
+		ID:                m.ID,
+		Object:            "model",
+		Created:           now,
+		OwnedBy:           "workbuddy",
+		Name:              m.Name,
+		Description:       m.Description,
+		Vendor:            m.Vendor,
+		MaxInputTokens:    m.MaxInputTokens,
+		MaxOutputTokens:   m.MaxOutputTokens,
+		SupportsImages:    m.SupportsImages,
+		SupportsToolCall:  m.SupportsToolCall,
+		SupportsReasoning: m.SupportsReasoning,
+		Credits:           m.Credits,
+	}
+}
+
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+	// GET /v1/models/<id> — a single model, or an OpenAI-shaped 404.
+	if id := trimModelID(r.URL.Path); id != "" {
+		s.handleModelByID(w, id)
 		return
 	}
 	models, err := GetModels(s.auth)
@@ -89,19 +135,44 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "fetch models: "+err.Error(), "server_error")
 		return
 	}
-	type model struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
-	}
 	now := time.Now().Unix()
-	list := make([]model, 0, len(models))
+	list := make([]modelObject, 0, len(models))
 	for _, m := range models {
-		list = append(list, model{ID: m.ID, Object: "model", Created: now, OwnedBy: "workbuddy"})
+		list = append(list, toModelObject(m, now))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": list})
+}
+
+// trimModelID returns the <id> segment of /v1/models/<id>, or "" when the path
+// addresses the collection itself. An id containing "/" is not a model id.
+func trimModelID(path string) string {
+	const prefix = "/v1/models/"
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	id := strings.TrimPrefix(path, prefix)
+	if id == "" || strings.Contains(id, "/") {
+		return ""
+	}
+	return id
+}
+
+// handleModelByID serves GET /v1/models/<id>.
+func (s *Server) handleModelByID(w http.ResponseWriter, id string) {
+	models, err := GetModels(s.auth)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "fetch models: "+err.Error(), "server_error")
+		return
+	}
+	for _, m := range models {
+		if m.ID == id {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(toModelObject(m, time.Now().Unix()))
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "model not found: "+id, "invalid_request_error")
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
