@@ -1,7 +1,7 @@
 name: Release
 
-# Every push to main bumps the patch version, tags it, builds the exe and
-# publishes a GitHub Release with the commit log as release notes.
+# Every push to main bumps the patch version, tags it, builds for all
+# platforms, and publishes a GitHub Release with binaries attached.
 on:
   push:
     branches: [main]
@@ -17,22 +17,71 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            artifact: WorkBuddy2API-windows-amd64.exe
+          - goos: linux
+            goarch: amd64
+            artifact: WorkBuddy2API-linux-amd64
+          - goos: linux
+            goarch: arm64
+            artifact: WorkBuddy2API-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            artifact: WorkBuddy2API-macos-amd64
+          - goos: darwin
+            goarch: arm64
+            artifact: WorkBuddy2API-macos-arm64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: stable
 
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          name="${{ matrix.artifact }}"
+          # strip suffix for non-exe builds
+          go build -ldflags "-X main.Version=v${version}" -o "${name}" .
+          echo "Built ${name}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync to current main tip
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+
       - name: Bump patch version
         id: bump
-        shell: bash
         run: |
           set -euo pipefail
           current="$(tr -d '[:space:]' < VERSION)"
@@ -42,12 +91,41 @@ jobs:
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "Bumped $current -> $next"
 
-      - name: Build
-        shell: bash
-        run: go build -ldflags "-X main.Version=v${{ steps.bump.outputs.version }}" -o WorkBuddy2API.exe .
+      - name: Commit version bump
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: release v${{ steps.bump.outputs.version }} [skip ci]"
+          git push
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.sha }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f | while read f; do
+            cp "$f" release/
+          done
+          ls release/
 
       - name: Build release notes
-        shell: bash
         run: |
           set -euo pipefail
           prev="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
@@ -63,30 +141,22 @@ jobs:
             echo
             echo "## Install"
             echo
-            echo "Download \`WorkBuddy2API.exe\` below and run it."
+            echo "Download the binary for your platform below."
           } > RELEASE_NOTES.md
-          cat RELEASE_NOTES.md
 
-      - name: Commit version bump
-        shell: bash
+      - name: Tag
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add VERSION
-          git commit -m "chore: release v${{ steps.bump.outputs.version }} [skip ci]"
-          git push
-
-      - name: Tag
-        shell: bash
-        run: |
-          git tag "v${{ steps.bump.outputs.version }}"
-          git push origin "v${{ steps.bump.outputs.version }}"
+          version="${{ needs.version.outputs.version }}"
+          git tag "v${version}"
+          git push origin "v${version}"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "v${{ steps.bump.outputs.version }}"
-          name: "v${{ steps.bump.outputs.version }}"
+          tag_name: "v${{ needs.version.outputs.version }}"
+          name: "v${{ needs.version.outputs.version }}"
           body_path: RELEASE_NOTES.md
-          files: WorkBuddy2API.exe
+          files: release/*
           make_latest: true
