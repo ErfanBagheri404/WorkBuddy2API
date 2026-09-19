@@ -28,6 +28,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/models/", s.handleModels)   // catches /v1/models/<id>
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	mux.HandleFunc("/v1/messages", s.handleAnthropic)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown endpoint", "not_found")
@@ -452,4 +453,77 @@ func writeError(w http.ResponseWriter, status int, msg, typ string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{"message": msg, "type": typ},
 	})
+}
+
+// handleAnthropic serves POST /v1/messages (Anthropic Messages API).
+// Translates to upstream OpenAI chat, translates the response back.
+func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 10<<20))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "read body: "+err.Error(), "invalid_request_error")
+		return
+	}
+	var ar anthropicRequest
+	if err := json.Unmarshal(body, &ar); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error")
+		return
+	}
+	if strings.TrimSpace(ar.Model) == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
+		return
+	}
+	if ar.MaxTokens <= 0 {
+		ar.MaxTokens = 4096
+	}
+
+	// Convert Anthropic request → OpenAI payload
+	payload := anthropicToOpenAI(&ar)
+
+	// Desensitize system prompt if enabled
+	if s.desensitize {
+		if msgs, ok := payload["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok {
+				if role, ok := first["role"].(string); ok && strings.EqualFold(role, "system") {
+					if content, ok := first["content"].(string); ok {
+						if rewritten, changed := desensitizePrompt(content); changed {
+							first["content"] = rewritten
+						}
+					}
+				}
+			}
+		}
+	}
+
+	openaiBody, _ := json.Marshal(payload)
+
+	cid := newCorrelationID()
+	started := time.Now()
+	logLine(cid, "▶ ANTHROPIC %s | max_tokens=%d | stream=%v",
+		ar.Model, ar.MaxTokens, ar.Stream == nil || *ar.Stream)
+
+	resp, err := s.client.Chat(openaiBody)
+	if err != nil {
+		logLine(cid, "✗ UPSTREAM ERROR %s | %s", ar.Model, err)
+		writeAnthropicError(w, http.StatusBadGateway, "upstream: "+err.Error(), "api_error")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		logLine(cid, "✗ UPSTREAM HTTP %d", resp.StatusCode)
+		writeAnthropicError(w, resp.StatusCode, string(errBody), "api_error")
+		return
+	}
+
+	if ar.Stream == nil || *ar.Stream {
+		anthropicStream(w, resp, &ar, cid)
+	} else {
+		anthropicNonStream(w, resp, &ar, cid)
+	}
+	logLine(cid, "◀ ANTHROPIC %s | %.1fs", ar.Model, time.Since(started).Seconds())
 }
