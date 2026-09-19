@@ -135,6 +135,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// When the client wants non-streaming, buffer the SSE chunks and return
 	// a single assembled JSON response.
 	clientWantsStream := probe.Stream == nil || *probe.Stream
+
+	cid := newCorrelationID()
+	started := time.Now()
+	reqModel, _, msgCount, lastUser := summariseRequest(body)
+	logLine(cid, "▶ REQUEST %s | stream=%v | msgs=%d | last_user=%q",
+		reqModel, clientWantsStream, msgCount, lastUser)
+	logBlock(cid, "REQUEST BODY", string(body))
+
 	var payload map[string]any
 	_ = json.Unmarshal(body, &payload)
 	payload["stream"] = true
@@ -161,18 +169,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.client.Chat(body)
 	if err != nil {
+		logLine(cid, "✗ UPSTREAM ERROR %s | %s", reqModel, err)
 		writeError(w, http.StatusBadGateway, "upstream: "+err.Error(), "server_error")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		copyBody(w, resp, resp.StatusCode)
+		// Read the full error body so upstream messages are never truncated.
+		errBody, _ := io.ReadAll(resp.Body)
+		logLine(cid, "✗ UPSTREAM HTTP %d | %s", resp.StatusCode, redact(string(errBody)))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(errBody)
 		return
 	}
 
 	if clientWantsStream {
-		copySSE(w, resp)
+		copySSELogged(w, resp, cid, reqModel, started)
 		return
 	}
 
@@ -189,6 +203,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		model string
 	)
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -263,6 +278,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// A mid-stream read failure must not be reported as a completed response.
+	if err := scanner.Err(); err != nil {
+		logLine(cid, "✗ UPSTREAM STREAM ERROR %s | %s", reqModel, err)
+		writeError(w, http.StatusBadGateway, "upstream stream: "+err.Error(), "server_error")
+		return
+	}
 	// Emit one response choice per upstream choice.
 	choices := make([]map[string]any, 0, len(accByIndex))
 	for idx, acc := range accByIndex {
@@ -285,13 +306,62 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"finish_reason": acc.finish,
 		})
 	}
+	chars := 0
+	for _, acc := range accByIndex {
+		for _, s := range acc.collected {
+			chars += len(s)
+		}
+	}
+	logLine(cid, "◀ RESPONSE %s | %.1fs | finish=%s | chars=%d",
+		reqModel, time.Since(started).Seconds(), choices[0]["finish_reason"], chars)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	respPayload := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"model":   model,
 		"choices": choices,
-	})
+	}
+	if out, err := json.Marshal(respPayload); err == nil {
+		logBlock(cid, "RESPONSE BODY", string(out))
+	}
+	json.NewEncoder(w).Encode(respPayload)
+}
+
+// copySSELogged streams SSE to the client while capturing the raw upstream
+// stream for the trace file. Parses complete SSE data lines one at a time so
+// that a finish_reason split across two reads is not silently dropped.
+func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel string, started time.Time) {
+	dst.Header().Set("Content-Type", "text/event-stream")
+	dst.Header().Set("Cache-Control", "no-cache")
+	dst.Header().Set("Connection", "keep-alive")
+	flusher, _ := dst.(http.Flusher)
+
+	var raw strings.Builder
+	finish := "stop"
+	chars := 0
+	scanner := bufio.NewScanner(src.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Emit original line (without trailing newline, since Scan strips it).
+		dst.Write([]byte(line + "\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if LoggingEnabled() {
+			raw.WriteString(line + "\n")
+			chars += len(line) + 1
+			finish = finishReasonFromLine(line, finish)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		logLine(cid, "✗ UPSTREAM STREAM ERROR %s | %s", reqModel, err)
+	}
+	if LoggingEnabled() {
+		logLine(cid, "◀ RESPONSE %s | %.1fs | finish=%s | chars=%d (streamed)",
+			reqModel, time.Since(started).Seconds(), finish, chars)
+		logBlock(cid, "RESPONSE RAW SSE", raw.String())
+	}
 }
 
 // assembledToolCall is the non-streaming form of a tool call rebuilt from

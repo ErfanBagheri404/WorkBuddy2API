@@ -28,6 +28,9 @@ func main() {
 	optDesensitize = flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "" &&
 		flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "0"
 	optRateLimit = parseInterval(flagValue("--rate-limit", "WORKBUDDY2API_RATE_LIMIT"))
+	if err := EnableLogging(flagValue("--log", "WORKBUDDY2API_LOG")); err != nil {
+		fmt.Fprintf(os.Stderr, "logging disabled: %v\n", err)
+	}
 	if headless {
 		runHeadless(apiKey)
 		return
