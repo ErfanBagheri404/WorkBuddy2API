@@ -25,11 +25,29 @@ func main() {
 		}
 	}
 	apiKey := flagValue("--api-key", "WORKBUDDY2API_KEY")
-	optDesensitize = flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "" &&
-		flagValue("--desensitize", "WORKBUDDY2API_DESENSITIZE") != "0"
+	optDesensitize = boolFlag("--desensitize", "WORKBUDDY2API_DESENSITIZE")
 	optRateLimit = parseInterval(flagValue("--rate-limit", "WORKBUDDY2API_RATE_LIMIT"))
+	forceImport = boolFlag("--import-creds", "WORKBUDDY2API_IMPORT_CREDS")
+	optAccount = flagValue("--account", "WORKBUDDY2API_ACCOUNT")
 	if err := EnableLogging(flagValue("--log", "WORKBUDDY2API_LOG")); err != nil {
 		fmt.Fprintf(os.Stderr, "logging disabled: %v\n", err)
+	}
+	// --import-creds is an init-only operation: import, report, exit. Keeping it
+	// here (and returning) means the import never runs twice and headless mode
+	// never starts a server on the back of an import-only invocation.
+	if forceImport {
+		authFile := defaultAuthPath()
+		src, err := ImportDesktopCredentials(authFile, true)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "import credentials: %v\n", err)
+			os.Exit(1)
+		}
+		if src == "" {
+			fmt.Fprintln(os.Stderr, "no WorkBuddy desktop credentials found")
+			os.Exit(1)
+		}
+		fmt.Printf("imported credentials from %s\n", src)
+		return
 	}
 	if headless {
 		runHeadless(apiKey)
@@ -38,10 +56,12 @@ func main() {
 	runInteractive(apiKey)
 }
 
-// optDesensitize / optRateLimit are process-wide flags for anti-block mode.
+// optDesensitize / optRateLimit / forceImport / optAccount are process-wide flags.
 var (
 	optDesensitize bool
 	optRateLimit   time.Duration
+	forceImport    bool
+	optAccount     string
 )
 
 // parseInterval accepts "2s"/"500ms" or a bare number of seconds.
@@ -74,6 +94,30 @@ func newLimiter() *RateLimiter {
 	return rl
 }
 
+// boolFlag reports whether a valueless switch was passed, or whether the
+// environment variable holds a truthy value. Accepts --name, --name=true, and
+// --name=false so a scripted invocation can explicitly disable it.
+func boolFlag(name, env string) bool {
+	for _, arg := range os.Args[1:] {
+		if arg == name {
+			return true
+		}
+		if v, ok := strings.CutPrefix(arg, name+"="); ok {
+			switch strings.ToLower(v) {
+			case "0", "false", "no":
+				return false
+			default:
+				return true
+			}
+		}
+	}
+	switch strings.ToLower(os.Getenv(env)) {
+	case "", "0", "false", "no":
+		return false
+	}
+	return true
+}
+
 // flagValue returns the value of --name=value or --name value, falling back
 // to the given environment variable.
 func flagValue(name, env string) string {
@@ -93,6 +137,14 @@ func runInteractive(apiKey string) {
 	printBanner()
 
 	authFile := defaultAuthPath()
+
+	// --import-creds returns in main(); reaching runInteractive means it is not
+	// set.  When no stored credentials exist, try the desktop app silently.
+	if !hasStoredAuth(authFile) {
+		if src, err := ImportDesktopCredentials(authFile, false); err == nil && src != "" {
+			fmt.Printf("  Imported existing WorkBuddy desktop credentials from\n    %s\n\n", src)
+		}
+	}
 
 	if !hasStoredAuth(authFile) {
 		fmt.Println("  No credentials found.")
@@ -205,21 +257,46 @@ func showModels(authFile string) {
 		fmt.Printf("  ✗ Auth error: %v\n\n", err)
 		return
 	}
-		fmt.Println("  Fetching models from WorkBuddy...")
-		fmt.Println()
-		models, err := GetModels(am)
-		if err != nil {
-			fmt.Printf("  ✗ Fetch failed: %v\n\n", err)
-			return
+	fmt.Println("  Fetching models from WorkBuddy...")
+	fmt.Println()
+	models, err := GetModels(am)
+	if err != nil {
+		fmt.Printf("  ✗ Fetch failed: %v\n\n", err)
+		return
+	}
+	for _, m := range models {
+		def := ""
+		if m.Default {
+			def = " (default)"
 		}
-		for _, m := range models {
-			def := ""
-			if m.Default {
-				def = " (default)"
-			}
-			fmt.Printf("    - %s  %s%s\n", m.ID, m.Name, def)
+		fmt.Printf("    - %s  %s%s\n", m.ID, m.Name, def)
+		if caps := modelCapabilities(m); caps != "" {
+			fmt.Printf("        %s\n", caps)
 		}
-		fmt.Println()
+	}
+	fmt.Println()
+}
+
+// modelCapabilities renders the capability and context-window badges for the
+// CLI model list.
+func modelCapabilities(m CachedModel) string {
+	var parts []string
+	if m.MaxInputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("in=%d", m.MaxInputTokens))
+	}
+	if m.MaxOutputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("out=%d", m.MaxOutputTokens))
+	}
+	if m.SupportsImages {
+		parts = append(parts, "images")
+	}
+	if m.SupportsToolCall {
+		parts = append(parts, "tools")
+	}
+	if m.SupportsReasoning {
+		parts = append(parts, "reasoning")
+	}
+	return strings.Join(parts, " ")
 }
 
 func testChat(authFile string) {
@@ -293,14 +370,34 @@ func testChat(authFile string) {
 	fmt.Println()
 }
 
+// newClientForAuth builds the upstream client for a server run. When multiple
+// account files exist under ~/.workbuddy2api/accounts/, it returns a
+// pool-backed client with round-robin selection and quota failover; otherwise
+// it falls back to the single-account client.
+func newClientForAuth(authFile string) (*UpstreamClient, *AuthManager, error) {
+	pool, perr := LoadAccountPool(optAccount)
+	if perr == nil && pool.Count() > 1 {
+		fmt.Printf("  Accounts: %d (%s)\n", pool.Count(), strings.Join(pool.All(), ", "))
+		if optAccount != "" {
+			fmt.Printf("  Pinned to: %s\n", optAccount)
+		}
+		am := pool.Peek()
+		return NewUpstreamClientPool(pool), am, nil
+	}
+	am, err := LoadAuthManager(authFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return NewUpstreamClient(am), am, nil
+}
+
 func startServer(authFile, apiKey string) {
 	fmt.Println()
-	am, err := LoadAuthManager(authFile)
+	client, am, err := newClientForAuth(authFile)
 	if err != nil {
 		fmt.Printf("  ✗ Auth error: %v\n\n", err)
 		return
 	}
-	client := NewUpstreamClient(am)
 	srv := NewServer(client, am, apiKey, optDesensitize, newLimiter())
 
 	addr := ":61021"

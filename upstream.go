@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,11 +11,24 @@ import (
 	"time"
 )
 
-// CachedModel holds info from /v2/enterprises/personal/models.
+// CachedModel holds info from /v2/enterprises/personal/models. The capability
+// and context-window fields are passed through to /v1/models so clients can
+// render badges and pick a model by window size.
 type CachedModel struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Default bool   `json:"isDefault"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Default     bool   `json:"isDefault"`
+	Description string `json:"descriptionEn,omitempty"`
+	Vendor      string `json:"vendor,omitempty"`
+
+	MaxInputTokens  int `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+
+	SupportsImages    bool `json:"supportsImages,omitempty"`
+	SupportsToolCall  bool `json:"supportsToolCall,omitempty"`
+	SupportsReasoning bool `json:"supportsReasoning,omitempty"`
+
+	Credits string `json:"credits,omitempty"`
 }
 
 // ModelCache fetches and caches the model list from WorkBuddy.
@@ -112,13 +126,21 @@ func DefaultModel(models []CachedModel) string {
 	return "default-model"
 }
 
-// UpstreamClient forwards chat requests to WorkBuddy.
+// UpstreamClient forwards chat requests to WorkBuddy. When an AccountPool is
+// set, it transparently retries on 429/quota errors using the next account.
 type UpstreamClient struct {
 	auth *AuthManager
+	pool *AccountPool
 }
 
 func NewUpstreamClient(am *AuthManager) *UpstreamClient {
 	return &UpstreamClient{auth: am}
+}
+
+// NewUpstreamClientPool creates a client backed by an account pool for
+// round-robin selection and failover.
+func NewUpstreamClientPool(pool *AccountPool) *UpstreamClient {
+	return &UpstreamClient{auth: pool.Next(), pool: pool}
 }
 
 // Chat forwards an OpenAI chat request to /v2/chat/completions.
@@ -157,12 +179,79 @@ func (c *UpstreamClient) Chat(reqBody []byte) (*http.Response, error) {
 	if stream {
 		accept = "text/event-stream, application/json"
 	}
-	resp, err := c.auth.doUpstream(http.MethodPost, "/v2/chat/completions", body,
+	resp, err := c.doWithFailover(http.MethodPost, "/v2/chat/completions", body,
 		map[string]string{"Accept": accept})
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	return resp, nil
+}
+
+// doWithFailover posts to upstream. With a pool and quota errors, it retries
+// on subsequent accounts. Non-streaming responses are read fully so failover
+// can inspect the body; streaming responses are returned immediately (SSE has
+// already started, so the response status can still signal quota errors).
+func (c *UpstreamClient) doWithFailover(method, path string, body []byte, headers map[string]string) (*http.Response, error) {
+	var lastErr error
+	var lastResp *http.Response
+	// Try the current account, then up to (count-1) more.
+	attempts := 1
+	if c.pool != nil {
+		attempts = c.pool.Count()
+	}
+	for i := 0; i < attempts; i++ {
+		am := c.currentAuth()
+		resp, err := am.doUpstream(method, path, body, headers)
+		if err != nil {
+			lastErr = err
+			if c.pool != nil {
+				c.advance()
+				continue
+			}
+			return nil, err
+		}
+		// A 429 with an empty stream body is a quota/rate-limit signal.
+		// Non-stream: check body for quota markers.
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastResp = newHTTPResponse(resp, errBody)
+			if c.pool != nil && IsQuotaError(resp.StatusCode, string(errBody)) {
+				c.advance()
+				continue
+			}
+			// No pool or not a quota error: surface it.
+			return newHTTPResponse(resp, errBody), nil
+		}
+		return resp, nil
+	}
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	return nil, fmt.Errorf("all accounts failed; last error: %w", lastErr)
+}
+
+// currentAuth returns the auth manager for the current pool position
+// without advancing. The caller must call advance() separately.
+func (c *UpstreamClient) currentAuth() *AuthManager {
+	if c.pool != nil {
+		return c.pool.Peek()
+	}
+	return c.auth
+}
+
+func (c *UpstreamClient) advance() {
+	if c.pool != nil {
+		c.pool.Next()
+	}
+}
+
+// newHTTPResponse rebuilds an *http.Response with the body already read,
+// so the caller can read it without the original (closed) body.
+func newHTTPResponse(orig *http.Response, body []byte) *http.Response {
+	clone := *orig
+	clone.Body = io.NopCloser(bytes.NewReader(body))
+	return &clone
 }
 
 func copySSE(dst http.ResponseWriter, src *http.Response) {
