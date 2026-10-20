@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -322,7 +326,9 @@ func (a *AuthManager) doUpstream(method, path string, body []byte, extraHeaders 
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("X-Request-ID", newRequestID())
+	if req.Header.Get("X-Request-ID") == "" {
+		req.Header.Set("X-Request-ID", newRequestID())
+	}
 	return a.client.Do(req)
 }
 
@@ -378,4 +384,29 @@ func (a *AuthManager) refreshLocked() error {
 
 func newRequestID() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+}
+
+// stableUUID derives an RFC-4122 v5-shaped UUID from a key using SHA-1,
+// mirroring the official client's per-conversation id derivation.
+func stableUUID(key string) string {
+	h := sha1.Sum([]byte(key))
+	hexStr := hex.EncodeToString(h[:])
+	parseHex := func(s string) uint64 {
+		v, _ := strconv.ParseUint(s, 16, 64)
+		return v
+	}
+	timeHigh := (parseHex(hexStr[12:16]) & 0x0fff) | 0x5000
+	clockSeq := (parseHex(hexStr[16:20]) & 0x3fff) | 0x8000
+	return fmt.Sprintf("%s-%s-%04x-%04x-%s", hexStr[0:8], hexStr[8:12], timeHigh, clockSeq, hexStr[20:32])
+}
+
+// randomUUID generates an RFC-4122 v4 UUID.
+func randomUUID() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

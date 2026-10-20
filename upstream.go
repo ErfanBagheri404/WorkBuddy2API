@@ -179,8 +179,67 @@ func (c *UpstreamClient) Chat(reqBody []byte) (*http.Response, error) {
 	if stream {
 		accept = "text/event-stream, application/json"
 	}
-	resp, err := c.doWithFailover(http.MethodPost, "/v2/chat/completions", body,
-		map[string]string{"Accept": accept})
+
+	// Upstream channel verification (code 11128, since 2026-10-15): the
+	// gateway rejects chat requests that don't carry the X-Conversation-*
+	// header family the official IDE sends on every turn. Derive a stable
+	// conversation id from the session key (or the opening user message) and
+	// mint fresh per-request / per-message UUIDs.
+	sessionKey := ""
+	for _, k := range []string{"session_id", "prompt_cache_key", "conversation_id"} {
+		if v, ok := payload[k].(string); ok && v != "" {
+			sessionKey = v
+			break
+		}
+	}
+	userText := ""
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		switch v := mm["content"].(type) {
+		case string:
+			userText = v
+		case []any:
+			var parts []string
+			for _, b := range v {
+				bm, ok := b.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := bm["text"].(string); t != "" {
+					parts = append(parts, t)
+				}
+			}
+			userText = strings.Join(parts, "\n")
+		}
+		break
+	}
+	conversationKey := sessionKey
+	if conversationKey == "" && userText != "" {
+		conversationKey = "cbai:" + userText
+	}
+	convID := randomUUID()
+	if conversationKey != "" {
+		convID = stableUUID(conversationKey)
+	}
+	reqID := randomUUID()
+	msgID := randomUUID()
+
+	extraHeaders := map[string]string{
+		"Accept":                       accept,
+		"X-Conversation-ID":            convID,
+		"X-Conversation-Request-ID":     reqID,
+		"X-Conversation-Message-ID":     msgID,
+		"X-Request-ID":                 msgID,
+	}
+
+	resp, err := c.doWithFailover(http.MethodPost, "/v2/chat/completions", body, extraHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
