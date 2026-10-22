@@ -275,6 +275,13 @@ func LoadAuthManager(path string) (*AuthManager, error) {
 	return am, nil
 }
 
+// UID returns the account uid the upstream calls are made with.
+func (a *AuthManager) UID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.uid
+}
+
 func (a *AuthManager) saveLocked() error {
 	a.data.Account.UID = a.uid
 	a.data.Auth.Domain = a.domain

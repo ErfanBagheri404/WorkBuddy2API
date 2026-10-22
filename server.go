@@ -101,6 +101,10 @@ type modelObject struct {
 	SupportsReasoning bool `json:"supports_reasoning,omitempty"`
 
 	Credits string `json:"credits,omitempty"`
+	Free    bool   `json:"free,omitempty"`
+
+	OnlyReasoning      bool `json:"only_reasoning,omitempty"`
+	CanDisableThinking bool `json:"can_disable_thinking,omitempty"`
 }
 
 func toModelObject(m CachedModel, now int64) modelObject {
@@ -114,10 +118,13 @@ func toModelObject(m CachedModel, now int64) modelObject {
 		Vendor:            m.Vendor,
 		MaxInputTokens:    m.MaxInputTokens,
 		MaxOutputTokens:   m.MaxOutputTokens,
-		SupportsImages:    m.SupportsImages,
-		SupportsToolCall:  m.SupportsToolCall,
-		SupportsReasoning: m.SupportsReasoning,
-		Credits:           m.Credits,
+		SupportsImages:     m.SupportsImages,
+		SupportsToolCall:   m.SupportsToolCall,
+		SupportsReasoning:  m.SupportsReasoning,
+		Credits:            m.Credits,
+		Free:               m.Free,
+		OnlyReasoning:      m.OnlyReasoning,
+		CanDisableThinking: m.CanDisableThinking,
 	}
 }
 
@@ -136,6 +143,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "fetch models: "+err.Error(), "server_error")
 		return
 	}
+	models = FilterUsableModels(s.auth.UID(), models)
+	MaybeProbeModels(s.client, s.auth.UID(), models)
 	now := time.Now().Unix()
 	list := make([]modelObject, 0, len(models))
 	for _, m := range models {
@@ -166,6 +175,7 @@ func (s *Server) handleModelByID(w http.ResponseWriter, id string) {
 		writeError(w, http.StatusBadGateway, "fetch models: "+err.Error(), "server_error")
 		return
 	}
+	models = FilterUsableModels(s.auth.UID(), models)
 	for _, m := range models {
 		if m.ID == id {
 			w.Header().Set("Content-Type", "application/json")
@@ -251,6 +261,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Read the full error body so upstream messages are never truncated.
 		errBody, _ := io.ReadAll(resp.Body)
 		logLine(cid, "✗ UPSTREAM HTTP %d | %s", resp.StatusCode, redact(string(errBody)))
+		if verdict := ClassifyModelError(resp.StatusCode, errBody); verdict != "" {
+			RecordModelVerdict(s.auth.UID(), reqModel, verdict)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(errBody)
@@ -516,6 +529,9 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(resp.Body)
 		logLine(cid, "✗ UPSTREAM HTTP %d", resp.StatusCode)
+		if verdict := ClassifyModelError(resp.StatusCode, errBody); verdict != "" {
+			RecordModelVerdict(s.auth.UID(), ar.Model, verdict)
+		}
 		writeAnthropicError(w, resp.StatusCode, string(errBody), "api_error")
 		return
 	}

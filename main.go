@@ -239,12 +239,20 @@ func showStatus(authFile string) {
 	if err != nil {
 		fmt.Printf("    (could not fetch: %v)\n", err)
 	} else {
+		models = FilterUsableModels(am.UID(), models)
 		for _, m := range models {
 			def := ""
 			if m.Default {
 				def = " (default)"
 			}
-			fmt.Printf("    - %s  %s%s\n", m.ID, m.Name, def)
+			free := ""
+			if m.Free {
+				free = " (free)"
+			}
+			fmt.Printf("    - %s  %s%s%s\n", m.ID, m.Name, def, free)
+		}
+		if s := availabilitySummary(am.UID()); s != "" {
+			fmt.Printf("    %s\n", s)
 		}
 	}
 	fmt.Println()
@@ -264,15 +272,23 @@ func showModels(authFile string) {
 		fmt.Printf("  ✗ Fetch failed: %v\n\n", err)
 		return
 	}
+	models = FilterUsableModels(am.UID(), models)
 	for _, m := range models {
 		def := ""
 		if m.Default {
 			def = " (default)"
 		}
-		fmt.Printf("    - %s  %s%s\n", m.ID, m.Name, def)
+		free := ""
+		if m.Free {
+			free = " (free)"
+		}
+		fmt.Printf("    - %s  %s%s%s\n", m.ID, m.Name, def, free)
 		if caps := modelCapabilities(m); caps != "" {
 			fmt.Printf("        %s\n", caps)
 		}
+	}
+	if s := availabilitySummary(am.UID()); s != "" {
+		fmt.Printf("    %s\n", s)
 	}
 	fmt.Println()
 }
