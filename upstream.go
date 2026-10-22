@@ -29,6 +29,13 @@ type CachedModel struct {
 	SupportsReasoning bool `json:"supportsReasoning,omitempty"`
 
 	Credits string `json:"credits,omitempty"`
+	Free    bool   `json:"free,omitempty"`
+
+	// OnlyReasoning and CanDisableThinking come from the desktop app's
+	// product.json (the cloud list omits them). They drive the max_tokens
+	// floor in Chat: thinking models burn the whole budget on reasoning.
+	OnlyReasoning      bool `json:"only_reasoning,omitempty"`
+	CanDisableThinking bool `json:"can_disable_thinking,omitempty"`
 }
 
 // ModelCache fetches and caches the model list from WorkBuddy.
@@ -40,11 +47,14 @@ type ModelCache struct {
 
 var globalModelCache = &ModelCache{}
 
-// extraModels are direct model names accepted by /v2/chat/completions
-// but NOT advertised in /enterprises/personal/models.
-var extraModels = []CachedModel{
-	{ID: "deepseek-v4.1-flash", Name: "DeepSeek-V4.1-Flash"},
-	{ID: "deepseek-v3", Name: "DeepSeek-V3"},
+// knownDirectModels are chat endpoints that work against
+// /v2/chat/completions but belong to no catalog: direct model names accepted
+// by the gateway. They stay a tiny allowlist because nothing dynamic lists
+// them (product.json has "deepseek-v4.1-flash", which the dynamic merge picks
+// up on its own). Probe results still decide whether each one stays visible
+// for the current account.
+var knownDirectModels = []CachedModel{
+	{ID: "deepseek-v3", Name: "DeepSeek-V3", Credits: "x0.00 credits", Free: true},
 }
 
 // FetchModels hits the upstream /v2/enterprises/personal/models endpoint
@@ -72,18 +82,38 @@ func FetchModels(am *AuthManager) ([]CachedModel, error) {
 		return nil, fmt.Errorf("models API error code=%d", envelope.Code)
 	}
 	models := envelope.Data.Models
-	// Merge extra names that aren't already present.
+	// Merge names that aren't already present: the installed desktop app's
+	// product.json (adds every model WorkBuddy shipped but has not published
+	// to this endpoint yet) and the known direct names.
 	existing := make(map[string]bool, len(models))
 	for _, m := range models {
 		existing[m.ID] = true
 	}
-	for _, em := range extraModels {
+	byID, order, localPath := loadLocalModels()
+	for _, id := range order {
+		if !existing[id] {
+			models = append(models, cachedModelFromLocal(id, byID[id]))
+			existing[id] = true
+		}
+	}
+	for _, em := range knownDirectModels {
 		if !existing[em.ID] {
 			models = append(models, em)
 		}
 	}
+	// Capability metadata (thinking model, free credits) only product.json
+	// carries; cloud values win where both sides have the field.
+	for i := range models {
+		if lm, ok := byID[models[i].ID]; ok {
+			models[i] = enrichFromLocal(models[i], lm)
+		}
+		models[i].Free = models[i].Free || isFreeCredits(models[i].Credits)
+	}
 	if len(models) == 0 {
 		return nil, fmt.Errorf("no models returned")
+	}
+	if localPath != "" {
+		fmt.Printf("model catalog: %d from upstream, merged local product.json: %s\n", len(envelope.Data.Models), localPath)
 	}
 	globalModelCache.mu.Lock()
 	globalModelCache.models = models
@@ -145,6 +175,17 @@ func NewUpstreamClientPool(pool *AccountPool) *UpstreamClient {
 
 // Chat forwards an OpenAI chat request to /v2/chat/completions.
 func (c *UpstreamClient) Chat(reqBody []byte) (*http.Response, error) {
+	return c.chatWithOptions(reqBody, chatOptions{})
+}
+
+// chatOptions tunes what Chat rewrites before forwarding.
+type chatOptions struct {
+	// skipReasoningFloor leaves max_tokens untouched (model probing).
+	skipReasoningFloor bool
+}
+
+// chatWithOptions forwards an OpenAI chat request to /v2/chat/completions.
+func (c *UpstreamClient) chatWithOptions(reqBody []byte, opts chatOptions) (*http.Response, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(reqBody, &payload); err != nil {
 		return nil, fmt.Errorf("invalid request JSON: %w", err)
@@ -167,6 +208,15 @@ func (c *UpstreamClient) Chat(reqBody []byte) (*http.Response, error) {
 			"role":    "system",
 			"content": "You are a helpful assistant.",
 		}}, msgs...)
+	}
+
+	// Thinking models spend reasoning tokens out of the same max_tokens
+	// budget: a small budget produces reasoning_content but no answer. Give
+	// them a floor that can hold a short reasoning pass plus the answer.
+	if !opts.skipReasoningFloor {
+		if floor := reasoningTokenFloor(payload); floor > 0 {
+			payload["max_tokens"] = floor
+		}
 	}
 
 	body, err := json.Marshal(payload)
