@@ -1,0 +1,6 @@
+.git
+.github
+*.md
+*-auth.json
+*.info
+/dist/

@@ -205,6 +205,32 @@ cd WorkBuddy2API
 go build -ldflags "-X main.Version=v0.1.0" -o WorkBuddy2API.exe .
 ```
 
+## Docker image
+
+This fork publishes a public image to Docker Hub:
+[`notfancy/workbuddy2api`](https://hub.docker.com/r/notfancy/workbuddy2api).
+
+The image runs the same binary on a distroless `nonroot` base. Tokens are
+never baked in; mount a writable volume at `/auth`.
+
+```bash
+# First run: log in and write the token file into the volume.
+docker volume create workbuddy-auth
+docker run --rm -it -v workbuddy-auth:/auth -e HOME=/auth \
+  notfancy/workbuddy2api:latest
+
+# Then run the proxy on loopback only.
+docker run -d --name workbuddy2api --restart unless-stopped \
+  -p 127.0.0.1:61021:61021 \
+  -v workbuddy-auth:/auth -e HOME=/auth \
+  notfancy/workbuddy2api:latest --headless
+```
+
+The image is built by `.github/workflows/docker.yml` after every successful
+Release run, for `linux/amd64` and `linux/arm64`, tagged with the release
+version, the `v`-prefixed tag, and `latest`. Building it requires the
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` Actions secrets.
+
 ## Disclaimer
 
 Unofficial, community-built tool. Not affiliated with, endorsed by, or
