@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -244,7 +245,7 @@ func probeModel(client *UpstreamClient, uid, model string) {
 	if err != nil {
 		return
 	}
-	resp, err := client.chatWithOptions(body, chatOptions{skipReasoningFloor: true})
+	resp, err := client.chatWithOptions(context.Background(), body, chatOptions{skipReasoningFloor: true})
 	if err != nil {
 		return
 	}

@@ -83,6 +83,35 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// newStreamingHTTPClient creates a client for SSE chat requests. It shares the
+// resolver and transport of newHTTPClient but deliberately has no overall
+// Timeout: http.Client.Timeout is a deadline for the whole exchange, including
+// reading the response body, so a fixed value kills long generations at that
+// deadline and leaves the client with a truncated stream. Connect and TLS are
+// bounded by the dialer; ResponseHeaderTimeout bounds the wait for the response
+// headers so a hung upstream cannot hold the request open forever.
+func newStreamingHTTPClient() *http.Client {
+	c := newHTTPClient(0)
+	if transport, ok := c.Transport.(*http.Transport); ok {
+		transport.ResponseHeaderTimeout = 2 * time.Minute
+	}
+	return c
+}
+
+// bodyWantsStream reports whether a chat request body asks for SSE streaming.
+func bodyWantsStream(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var probe struct {
+		Stream *bool `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	return probe.Stream != nil && *probe.Stream
+}
+
 // failingResolver wraps a real resolver and falls back to hardcoded IPs
 // when DNS returns loopback/unusable addresses.
 type failingResolver struct {
@@ -240,12 +269,13 @@ func ImportDesktopCredentials(destPath string, force bool) (string, error) {
 
 // AuthManager holds the WorkBuddy session tokens and refreshes them.
 type AuthManager struct {
-	mu       sync.Mutex
-	path     string
-	data     *authData
-	client   *http.Client
-	uid      string
-	domain   string
+	mu           sync.Mutex
+	path         string
+	data         *authData
+	client       *http.Client
+	streamClient *http.Client
+	uid          string
+	domain       string
 }
 
 // LoadAuthManager reads stored credentials, refreshing the access token if needed.
@@ -261,7 +291,12 @@ func LoadAuthManager(path string) (*AuthManager, error) {
 	if d.Auth.AccessToken == "" || d.Auth.RefreshToken == "" {
 		return nil, fmt.Errorf("auth file missing tokens")
 	}
-	am := &AuthManager{path: path, data: &d, client: newHTTPClient(30 * time.Second)}
+	am := &AuthManager{
+		path:         path,
+		data:         &d,
+		client:       newHTTPClient(30 * time.Second),
+		streamClient: newStreamingHTTPClient(),
+	}
 	am.uid = d.Account.UID
 	am.domain = d.Auth.Domain
 	if time.Now().UnixMilli() > d.Auth.ExpiresAt-60_000 {
@@ -316,14 +351,65 @@ func (a *AuthManager) headers() map[string]string {
 	return h
 }
 
-func (a *AuthManager) doUpstream(method, path string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
+// sseIdleTimeout bounds how long the upstream may stay silent mid-stream.
+// It is not a cap on total generation time: it is refreshed whenever bytes
+// arrive, so a long-but-live stream runs indefinitely while a stalled body is
+// abandoned instead of pinning the handler forever.
+const sseIdleTimeout = 3 * time.Minute
+
+// idleReadCloser cancels the request context when no bytes arrive for idle,
+// which unblocks a stalled body read (cancelling a derived context would not:
+// the transport watches the request's own context).
+type idleReadCloser struct {
+	body   io.ReadCloser
+	cancel context.CancelFunc
+	timer  *time.Timer
+	idle   time.Duration
+}
+
+func (r *idleReadCloser) Read(p []byte) (int, error) {
+	n, err := r.body.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.idle)
+	}
+	return n, err
+}
+
+func (r *idleReadCloser) Close() error {
+	r.timer.Stop()
+	r.cancel()
+	return r.body.Close()
+}
+
+// clientFor picks the HTTP client for an upstream call. Streaming chat must not
+// use the fixed-timeout client: its deadline covers the whole exchange,
+// including reading the SSE body, and truncates long generations mid-stream.
+func (a *AuthManager) clientFor(path string, body []byte) *http.Client {
+	if path == "/v2/chat/completions" && a.streamClient != nil && bodyWantsStream(body) {
+		return a.streamClient
+	}
+	return a.client
+}
+
+func (a *AuthManager) doUpstream(ctx context.Context, method, path string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
 	u := upstreamBase + path
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, u, rdr)
+	streaming := a.clientFor(path, body) == a.streamClient
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if streaming {
+		// Own the context so a stalled body can be abandoned; the caller's
+		// context still propagates cancellation on client disconnect.
+		reqCtx, cancel = context.WithCancel(ctx)
+	} else {
+		cancel = func() {}
+	}
+	req, err := http.NewRequestWithContext(reqCtx, method, u, rdr)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	req.Host = upstreamHost
@@ -336,7 +422,22 @@ func (a *AuthManager) doUpstream(method, path string, body []byte, extraHeaders 
 	if req.Header.Get("X-Request-ID") == "" {
 		req.Header.Set("X-Request-ID", newRequestID())
 	}
-	return a.client.Do(req)
+	resp, err := a.clientFor(path, body).Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if streaming {
+		resp.Body = &idleReadCloser{
+			body:   resp.Body,
+			cancel: cancel,
+			idle:   sseIdleTimeout,
+			timer:  time.AfterFunc(sseIdleTimeout, cancel),
+		}
+	} else {
+		cancel()
+	}
+	return resp, nil
 }
 
 type refreshResponse struct {

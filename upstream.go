@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,7 +61,7 @@ var knownDirectModels = []CachedModel{
 // FetchModels hits the upstream /v2/enterprises/personal/models endpoint
 // and appends the extra known direct names.
 func FetchModels(am *AuthManager) ([]CachedModel, error) {
-	resp, err := am.doUpstream(http.MethodGet, "/v2/enterprises/personal/models", nil, nil)
+	resp, err := am.doUpstream(context.Background(), http.MethodGet, "/v2/enterprises/personal/models", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch models: %w", err)
 	}
@@ -174,8 +175,8 @@ func NewUpstreamClientPool(pool *AccountPool) *UpstreamClient {
 }
 
 // Chat forwards an OpenAI chat request to /v2/chat/completions.
-func (c *UpstreamClient) Chat(reqBody []byte) (*http.Response, error) {
-	return c.chatWithOptions(reqBody, chatOptions{})
+func (c *UpstreamClient) Chat(ctx context.Context, reqBody []byte) (*http.Response, error) {
+	return c.chatWithOptions(ctx, reqBody, chatOptions{})
 }
 
 // chatOptions tunes what Chat rewrites before forwarding.
@@ -185,7 +186,9 @@ type chatOptions struct {
 }
 
 // chatWithOptions forwards an OpenAI chat request to /v2/chat/completions.
-func (c *UpstreamClient) chatWithOptions(reqBody []byte, opts chatOptions) (*http.Response, error) {
+// ctx is the incoming client request's context: when the caller disconnects,
+// the upstream request is cancelled so generation stops instead of running on.
+func (c *UpstreamClient) chatWithOptions(ctx context.Context, reqBody []byte, opts chatOptions) (*http.Response, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(reqBody, &payload); err != nil {
 		return nil, fmt.Errorf("invalid request JSON: %w", err)
@@ -289,7 +292,7 @@ func (c *UpstreamClient) chatWithOptions(reqBody []byte, opts chatOptions) (*htt
 		"X-Request-ID":                 msgID,
 	}
 
-	resp, err := c.doWithFailover(http.MethodPost, "/v2/chat/completions", body, extraHeaders)
+	resp, err := c.doWithFailover(ctx, http.MethodPost, "/v2/chat/completions", body, extraHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
@@ -300,7 +303,7 @@ func (c *UpstreamClient) chatWithOptions(reqBody []byte, opts chatOptions) (*htt
 // on subsequent accounts. Non-streaming responses are read fully so failover
 // can inspect the body; streaming responses are returned immediately (SSE has
 // already started, so the response status can still signal quota errors).
-func (c *UpstreamClient) doWithFailover(method, path string, body []byte, headers map[string]string) (*http.Response, error) {
+func (c *UpstreamClient) doWithFailover(ctx context.Context, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
 	var lastErr error
 	var lastResp *http.Response
 	// Try the current account, then up to (count-1) more.
@@ -310,7 +313,7 @@ func (c *UpstreamClient) doWithFailover(method, path string, body []byte, header
 	}
 	for i := 0; i < attempts; i++ {
 		am := c.currentAuth()
-		resp, err := am.doUpstream(method, path, body, headers)
+		resp, err := am.doUpstream(ctx, method, path, body, headers)
 		if err != nil {
 			lastErr = err
 			if c.pool != nil {
