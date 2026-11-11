@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -265,5 +268,59 @@ func TestCopySSELogged_EmptyUpstreamStillTerminates(t *testing.T) {
 	}
 	if got := terminalFinishReasons(chunks); got[0] != "length" {
 		t.Fatalf("want synthesized finish_reason=length for choice 0, got %v", got)
+	}
+}
+
+// A client disconnect does not reliably fail the next write, so the copier must
+// also watch the request context. Without that it drains a generation nobody is
+// reading and the upstream keeps burning quota after the caller is gone.
+func TestCopySSELogged_StopsReadingAfterClientDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	src := &http.Response{StatusCode: http.StatusOK, Request: req, Body: pr}
+
+	done := make(chan struct{})
+	go func() {
+		copySSELogged(httptest.NewRecorder(), src, "cid-1", "hy4free", time.Now())
+		close(done)
+	}()
+
+	var written int64
+	go func() {
+		for i := 0; i < 500; i++ {
+			if _, err := fmt.Fprintf(pw, "%s", sseIntermediate); err != nil {
+				return
+			}
+			atomic.AddInt64(&written, 1)
+			time.Sleep(2 * time.Millisecond)
+		}
+		pw.Close()
+	}()
+
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("copySSELogged never returned after the client disconnected")
+	}
+	pw.Close()
+	if got := atomic.LoadInt64(&written); got >= 500 {
+		t.Fatalf("kept reading the upstream to completion after disconnect (%d chunks)", got)
+	}
+}
+
+// Without a request on the response (tests, internal callers) the copier must
+// still work and terminate the stream normally.
+func TestCopySSELogged_NoRequestStillTerminates(t *testing.T) {
+	src := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sseIntermediate))}
+	rec := httptest.NewRecorder()
+	copySSELogged(rec, src, "cid-1", "hy4free", time.Now())
+
+	_, doneCount := parseSSELines(t, rec.Body.String())
+	if doneCount != 1 {
+		t.Fatalf("want one [DONE] without a request context, got %d", doneCount)
 	}
 }

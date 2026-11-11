@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"io"
@@ -590,6 +591,15 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 	meta := sseChunkMeta{model: reqModel}
 	sawDone := false
 	writeFailed := false
+	clientGone := false
+
+	// A disconnect does not reliably fail the next write (the response may be
+	// buffered, and proxies can retry), so poll the request context explicitly.
+	// Without this the handler keeps draining a generation nobody is reading.
+	var reqCtx context.Context
+	if src.Request != nil {
+		reqCtx = src.Request.Context()
+	}
 
 	scanner := bufio.NewScanner(src.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
@@ -609,6 +619,10 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 		return true
 	}
 	for scanner.Scan() {
+		if reqCtx != nil && reqCtx.Err() != nil {
+			clientGone = true
+			break
+		}
 		line := scanner.Text()
 		if isDoneLine(line) {
 			if pending := pendingChoices(seenChoices, terminated); len(pending) > 0 {
@@ -639,6 +653,8 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 	}
 	if writeFailed {
 		logLine(cid, "✗ DOWNSTREAM WRITE FAILED %s | client disconnected", reqModel)
+	} else if clientGone {
+		logLine(cid, "✗ CLIENT DISCONNECTED %s | stopped reading upstream", reqModel)
 	} else {
 		// Never let the response end on a bare EOF: synthesize terminal chunks
 		// and the sentinel the client needs to treat the turn as complete.
