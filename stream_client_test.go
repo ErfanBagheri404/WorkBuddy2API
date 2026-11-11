@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -134,3 +135,58 @@ func TestClientFor_NilStreamingClientFallsBack(t *testing.T) {
 		t.Fatal("nil streamClient must fall back to the regular client")
 	}
 }
+
+// idleReadCloser must cancel the request when the upstream goes quiet, so a
+// body that stalls after the headers cannot pin the handler forever. Cancelling
+// a derived context would not unblock the read; the request's own context must
+// be the one cancelled.
+func TestIdleReadCloser_CancelsStalledBody(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	body := &stallingBody{ctx: ctx, first: []byte("data: first\n")}
+	timer := time.AfterFunc(50*time.Millisecond, cancel)
+	r := &idleReadCloser{body: body, cancel: cancel, idle: 50 * time.Millisecond, timer: timer}
+	defer r.Close()
+
+	first := make([]byte, 64)
+	if _, err := r.Read(first); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	// The timer is what unblocks the read -- not the test's own cleanup.
+	timer.Reset(50 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, err := r.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled read returned no error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled read never unblocked: idle deadline did not fire")
+	}
+}
+
+// stallingBody returns one chunk, then blocks until the request context is
+// cancelled -- the behaviour of reading a stalled HTTP response body.
+type stallingBody struct {
+	ctx   context.Context
+	first []byte
+	sent  bool
+}
+
+func (b *stallingBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, b.first), nil
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *stallingBody) Close() error { return nil }

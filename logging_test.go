@@ -54,6 +54,41 @@ func TestFinishReasonFromLine_HandlesSplitEvents(t *testing.T) {
 	}
 }
 
+func TestFinishReasonFromLine_AcceptsSpaceAfterColonVariants(t *testing.T) {
+	// SSE permits zero or more spaces after "data:". The gateway uses one,
+	// but a spec-compliant upstream may use none, so terminal detection must
+	// not depend on that detail.
+	for _, line := range []string{
+		`data:{"choices":[{"index":0,"finish_reason":"stop"}]}`,
+		`data:  {"choices":[{"index":0,"finish_reason":"stop"}]}`,
+		`data: {"choices":[{"index":0,"finish_reason":"stop"}]}`,
+	} {
+		if got := finishReasonFromLine(line, ""); got != "stop" {
+			t.Errorf("terminal chunk not recognized in %q: got %q", line, got)
+		}
+	}
+}
+
+func TestChoiceFinishReasons_PerChoiceTerminalState(t *testing.T) {
+	line := `data: {"choices":[{"index":0,"finish_reason":"stop"},{"index":1,"finish_reason":""},{"index":2,"finish_reason":"length"}]}`
+	got := choiceFinishReasons(line)
+	if len(got) != 2 || got[0] != "stop" || got[2] != "length" {
+		t.Fatalf("want terminal reasons for choices 0 and 2 only, got %v", got)
+	}
+	if _, ok := got[1]; ok {
+		t.Fatalf("empty finish_reason must not count as terminal, got %v", got)
+	}
+	if r := choiceFinishReasons(`data:{"choices":[{"index":1,"finish_reason":"stop"}]}`); r[1] != "stop" {
+		t.Fatalf("no-space data line not recognized: %v", r)
+	}
+	if r := choiceFinishReasons("data: [DONE]"); r != nil {
+		t.Fatalf("[DONE] must yield no per-choice reasons, got %v", r)
+	}
+	if r := choiceFinishReasons(`data: {"choices":[{"finish_rea`); r != nil {
+		t.Fatalf("fragment must yield no per-choice reasons, got %v", r)
+	}
+}
+
 func TestEnableLogging_EmptyPathDisables(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "trace.log")

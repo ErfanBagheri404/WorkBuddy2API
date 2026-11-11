@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -249,7 +250,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	body, _ = json.Marshal(payload)
 
-	resp, err := s.client.Chat(body)
+	resp, err := s.client.Chat(r.Context(), body)
 	if err != nil {
 		logLine(cid, "✗ UPSTREAM ERROR %s | %s", reqModel, err)
 		writeError(w, http.StatusBadGateway, "upstream: "+err.Error(), "server_error")
@@ -287,15 +288,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		id    string
 		model string
 	)
+	sawDone := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		data, ok := sseData(line)
+		if !ok {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk struct {
@@ -369,6 +372,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "upstream stream: "+err.Error(), "server_error")
 		return
 	}
+	// The upstream SSE must end with a terminal finish_reason (and, in
+	// practice, [DONE]); otherwise the content is a truncated generation and
+	// returning it as a completed JSON response would silently lose output.
+	unterminated := make([]int, 0, len(accByIndex))
+	for idx, acc := range accByIndex {
+		if acc.finish == "" {
+			unterminated = append(unterminated, idx)
+		}
+	}
+	if len(unterminated) > 0 || !sawDone {
+		sort.Ints(unterminated)
+		logLine(cid, "✗ UPSTREAM STREAM INCOMPLETE %s | unterminated choices=%v | done=%v",
+			reqModel, unterminated, sawDone)
+		writeError(w, http.StatusBadGateway, "upstream stream ended without finish_reason", "server_error")
+		return
+	}
 	// Emit one response choice per upstream choice.
 	choices := make([]map[string]any, 0, len(accByIndex))
 	for idx, acc := range accByIndex {
@@ -412,53 +431,134 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(respPayload)
 }
 
-// isDoneLine reports whether an SSE line is the [DONE] sentinel.
-func isDoneLine(line string) bool {
+// sseData extracts the payload of an SSE data line, accepting the spec's
+// optional whitespace after the colon. ok is false for non-data lines.
+func sseData(line string) (string, bool) {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "data:") {
-		return false
+		return "", false
 	}
-	return strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]"
+	return strings.TrimSpace(strings.TrimPrefix(line, "data:")), true
+}
+
+func isDoneLine(line string) bool {
+	data, ok := sseData(line)
+	return ok && data == "[DONE]"
 }
 
 // normalizeIntermediateFinishReason rewrites the non-standard
 // `"finish_reason": ""` that the upstream gateway puts on every intermediate
-// chunk to `null`, which is what the OpenAI schema specifies. Strict clients
-// reject the empty string. The rewrite is textual so the rest of the chunk
-// (ordering, omitting nothing) is preserved byte for byte.
+// chunk to `null`, which is what the OpenAI schema specifies. Parsing the line
+// as JSON (rather than replacing substrings) avoids corrupting chunk content
+// that happens to contain the same text, and covers any JSON whitespace layout.
 func normalizeIntermediateFinishReason(line string) string {
-	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "data:") || !strings.Contains(line, `"finish_reason"`) {
+	data, ok := sseData(line)
+	if !ok || data == "[DONE]" || !strings.Contains(data, `"finish_reason"`) {
 		return line
 	}
-	out := strings.ReplaceAll(line, `"finish_reason":""`, `"finish_reason":null`)
-	return strings.ReplaceAll(out, `"finish_reason": ""`, `"finish_reason": null`)
+	var chunk struct {
+		Choices []struct {
+			FinishReason json.RawMessage `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(data), &chunk) != nil {
+		return line
+	}
+	changed := false
+	for i := range chunk.Choices {
+		if string(chunk.Choices[i].FinishReason) == `""` {
+			chunk.Choices[i].FinishReason = json.RawMessage(`null`)
+			changed = true
+		}
+	}
+	if !changed {
+		return line
+	}
+	// Decode into a generic map so unknown upstream fields survive, then
+	// replace only the finish_reason values.
+	var generic map[string]json.RawMessage
+	if json.Unmarshal([]byte(data), &generic) != nil {
+		return line
+	}
+	var choices []map[string]json.RawMessage
+	if json.Unmarshal(generic["choices"], &choices) != nil {
+		return line
+	}
+	for i := range choices {
+		if string(choices[i]["finish_reason"]) == `""` {
+			choices[i]["finish_reason"] = json.RawMessage(`null`)
+		}
+	}
+	normalizedChoices, err := json.Marshal(choices)
+	if err != nil {
+		return line
+	}
+	generic["choices"] = normalizedChoices
+	payload, err := json.Marshal(generic)
+	if err != nil {
+		return line
+	}
+	return "data: " + string(payload)
 }
 
-// writeTerminalChunk emits a final OpenAI chunk carrying finish_reason, then
-// the [DONE] sentinel. copySSELogged uses it when the upstream stream ends
-// without one (timeout, dropped connection, truncated body): an SSE body that
-// simply stops is invalid output for OpenAI-compatible clients, which report
-// "stream ended without finish_reason" and retry work that already produced
-// tokens.
-func writeTerminalChunk(dst io.Writer, flusher http.Flusher, model, finish string) {
+// sseChunkMeta carries the identity of the upstream completion so a synthesized
+// terminal chunk belongs to the same completion as the chunks before it.
+type sseChunkMeta struct {
+	id    string
+	model string
+}
+
+func chunkMetaFromLine(line string, meta sseChunkMeta) sseChunkMeta {
+	data, ok := sseData(line)
+	if !ok || data == "[DONE]" {
+		return meta
+	}
+	var c struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	if json.Unmarshal([]byte(data), &c) != nil {
+		return meta
+	}
+	if c.ID != "" {
+		meta.id = c.ID
+	}
+	if c.Model != "" {
+		meta.model = c.Model
+	}
+	return meta
+}
+
+// writeTerminalChunks emits one final OpenAI chunk per choice index that has
+// not yet reported a finish_reason, then leaves [DONE] to the caller. It is
+// used when the upstream stream ends without terminating every choice: an SSE
+// body that simply stops is invalid output for OpenAI-compatible clients.
+func writeTerminalChunks(dst io.Writer, flusher http.Flusher, meta sseChunkMeta, pending []int) {
+	id := meta.id
+	if id == "" {
+		id = "chatcmpl-" + newRequestID()
+	}
+	model := meta.model
+	choices := make([]any, 0, len(pending))
+	for _, idx := range pending {
+		choices = append(choices, map[string]any{
+			"index":         idx,
+			"delta":         map[string]any{},
+			"finish_reason": "length",
+		})
+	}
 	chunk := map[string]any{
-		"id":      newRequestID(),
+		"id":      id,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []any{map[string]any{
-			"index":         0,
-			"delta":         map[string]any{},
-			"finish_reason": finish,
-		}},
+		"choices": choices,
 	}
 	payload, err := json.Marshal(chunk)
 	if err != nil {
 		return
 	}
-	// Leading blank line: the upstream event just forwarded may not have been
-	// terminated yet, and a stray blank line between events is harmless.
+	// Leading blank line closes any unterminated upstream event.
 	dst.Write([]byte("\ndata: " + string(payload) + "\n\n"))
 	if flusher != nil {
 		flusher.Flush()
@@ -485,13 +585,19 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 	var raw strings.Builder
 	finish := "stop"
 	chars := 0
-	sawTerminal := false
+	seenChoices := map[int]bool{}
+	terminated := map[int]bool{}
+	meta := sseChunkMeta{model: reqModel}
 	sawDone := false
+	writeFailed := false
+
 	scanner := bufio.NewScanner(src.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	writeLine := func(line string) {
+	writeLine := func(line string) bool {
 		// Emit original line (without trailing newline, since Scan strips it).
-		dst.Write([]byte(line + "\n"))
+		if _, err := dst.Write([]byte(line + "\n")); err != nil {
+			return false
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -500,40 +606,98 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 			chars += len(line) + 1
 			finish = finishReasonFromLine(line, finish)
 		}
+		return true
 	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		if isDoneLine(line) {
-			if !sawTerminal {
-				writeTerminalChunk(dst, flusher, reqModel, "length")
-				sawTerminal = true
+			if pending := pendingChoices(seenChoices, terminated); len(pending) > 0 {
+				writeTerminalChunks(dst, flusher, meta, pending)
 			}
-			writeLine(line)
+			if !writeLine(line) {
+				writeFailed = true
+				break
+			}
 			sawDone = true
 			// Anything after [DONE] belongs to no event the client will read.
 			break
 		}
-		if finishReasonFromLine(line, "") != "" {
-			sawTerminal = true
+		meta = chunkMetaFromLine(line, meta)
+		for idx := range choiceIndexes(line) {
+			seenChoices[idx] = true
 		}
-		writeLine(normalizeIntermediateFinishReason(line))
+		for idx := range choiceFinishReasons(line) {
+			terminated[idx] = true
+		}
+		if !writeLine(normalizeIntermediateFinishReason(line)) {
+			writeFailed = true
+			break
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		logLine(cid, "✗ UPSTREAM STREAM ERROR %s | %s", reqModel, err)
 	}
-	// Never let the response end on a bare EOF: synthesize the terminal chunk
-	// and sentinel the client needs to treat the turn as complete.
-	if !sawTerminal {
-		writeTerminalChunk(dst, flusher, reqModel, "length")
-	}
-	if !sawDone {
-		writeDONE(dst, flusher)
+	if writeFailed {
+		logLine(cid, "✗ DOWNSTREAM WRITE FAILED %s | client disconnected", reqModel)
+	} else {
+		// Never let the response end on a bare EOF: synthesize terminal chunks
+		// and the sentinel the client needs to treat the turn as complete.
+		// Only finish_reason is "length": that is what a truncated generation is.
+		if pending := pendingChoices(seenChoices, terminated); len(pending) > 0 {
+			logLine(cid, "⚠ SYNTHESIZED TERMINAL %s | choices=%v | upstream ended without finish_reason",
+				reqModel, pending)
+			writeTerminalChunks(dst, flusher, meta, pending)
+		}
+		if !sawDone {
+			writeDONE(dst, flusher)
+		}
 	}
 	if LoggingEnabled() {
 		logLine(cid, "◀ RESPONSE %s | %.1fs | finish=%s | chars=%d (streamed)",
 			reqModel, time.Since(started).Seconds(), finish, chars)
 		logBlock(cid, "RESPONSE RAW SSE", raw.String())
 	}
+}
+
+// choiceIndexes returns every choice index present on an SSE data line, even
+// when the chunk carries no terminal finish_reason (intermediate deltas).
+func choiceIndexes(line string) map[int]bool {
+	data, ok := sseData(line)
+	if !ok || data == "[DONE]" {
+		return nil
+	}
+	var c struct {
+		Choices []struct {
+			Index int `json:"index"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(data), &c) != nil {
+		return nil
+	}
+	out := make(map[int]bool, len(c.Choices))
+	for _, ch := range c.Choices {
+		out[ch.Index] = true
+	}
+	return out
+}
+
+// pendingChoices returns the sorted choice indexes that were seen but never
+// terminated. An empty stream still needs a terminal for choice 0.
+func pendingChoices(seen, terminated map[int]bool) []int {
+	if len(seen) == 0 {
+		if terminated[0] {
+			return nil
+		}
+		return []int{0}
+	}
+	var pending []int
+	for idx := range seen {
+		if !terminated[idx] {
+			pending = append(pending, idx)
+		}
+	}
+	sort.Ints(pending)
+	return pending
 }
 
 // assembledToolCall is the non-streaming form of a tool call rebuilt from
@@ -605,7 +769,7 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	logLine(cid, "▶ ANTHROPIC %s | max_tokens=%d | stream=%v",
 		ar.Model, ar.MaxTokens, ar.Stream == nil || *ar.Stream)
 
-	resp, err := s.client.Chat(openaiBody)
+	resp, err := s.client.Chat(r.Context(), openaiBody)
 	if err != nil {
 		logLine(cid, "✗ UPSTREAM ERROR %s | %s", ar.Model, err)
 		writeAnthropicError(w, http.StatusBadGateway, "upstream: "+err.Error(), "api_error")

@@ -147,10 +147,11 @@ func summariseRequest(body []byte) (model string, stream bool, msgs int, lastUse
 // parsing partial JSON would silently drop the upstream finish reason.
 func finishReasonFromLine(line, current string) string {
 	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "data: ") {
+	if !strings.HasPrefix(line, "data:") {
 		return current
 	}
-	data := strings.TrimPrefix(line, "data: ")
+	// SSE allows any amount of whitespace (including none) after the colon.
+	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 	if data == "[DONE]" {
 		return current
 	}
@@ -168,4 +169,34 @@ func finishReasonFromLine(line, current string) string {
 		}
 	}
 	return current
+}
+
+// choiceFinishReasons reports, per choice index, the finish_reason carried by
+// one SSE data line. Only non-empty reasons are returned: intermediate chunks
+// from the gateway carry an empty string, which is not a terminal marker.
+func choiceFinishReasons(line string) map[int]string {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return nil
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if data == "[DONE]" {
+		return nil
+	}
+	var c struct {
+		Choices []struct {
+			Index        int     `json:"index"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(data), &c) != nil {
+		return nil
+	}
+	out := make(map[int]string)
+	for _, ch := range c.Choices {
+		if ch.FinishReason != nil && *ch.FinishReason != "" {
+			out[ch.Index] = *ch.FinishReason
+		}
+	}
+	return out
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -347,7 +348,7 @@ func testChat(authFile string) {
 
 	payload := fmt.Sprintf(`{"model":"%s","stream":true,"messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":%s}],"max_tokens":512}`,
 		model, jsonEscapeString(line))
-	resp, err := am.doUpstream(http.MethodPost, "/v2/chat/completions", []byte(payload), map[string]string{"Accept": "text/event-stream"})
+	resp, err := am.doUpstream(context.Background(), http.MethodPost, "/v2/chat/completions", []byte(payload), map[string]string{"Accept": "text/event-stream"})
 	if err != nil {
 		fmt.Printf("  ✗ Request failed: %v\n\n", err)
 		return
