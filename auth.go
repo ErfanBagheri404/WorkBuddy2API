@@ -83,6 +83,35 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// newStreamingHTTPClient creates a client for SSE chat requests. It shares the
+// resolver and transport of newHTTPClient but deliberately has no overall
+// Timeout: http.Client.Timeout is a deadline for the whole exchange, including
+// reading the response body, so a fixed value kills long generations at that
+// deadline and leaves the client with a truncated stream. Connect and TLS are
+// bounded by the dialer; ResponseHeaderTimeout bounds the wait for the response
+// headers so a hung upstream cannot hold the request open forever.
+func newStreamingHTTPClient() *http.Client {
+	c := newHTTPClient(0)
+	if transport, ok := c.Transport.(*http.Transport); ok {
+		transport.ResponseHeaderTimeout = 2 * time.Minute
+	}
+	return c
+}
+
+// bodyWantsStream reports whether a chat request body asks for SSE streaming.
+func bodyWantsStream(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var probe struct {
+		Stream *bool `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	return probe.Stream != nil && *probe.Stream
+}
+
 // failingResolver wraps a real resolver and falls back to hardcoded IPs
 // when DNS returns loopback/unusable addresses.
 type failingResolver struct {
@@ -240,12 +269,13 @@ func ImportDesktopCredentials(destPath string, force bool) (string, error) {
 
 // AuthManager holds the WorkBuddy session tokens and refreshes them.
 type AuthManager struct {
-	mu       sync.Mutex
-	path     string
-	data     *authData
-	client   *http.Client
-	uid      string
-	domain   string
+	mu           sync.Mutex
+	path         string
+	data         *authData
+	client       *http.Client
+	streamClient *http.Client
+	uid          string
+	domain       string
 }
 
 // LoadAuthManager reads stored credentials, refreshing the access token if needed.
@@ -261,7 +291,12 @@ func LoadAuthManager(path string) (*AuthManager, error) {
 	if d.Auth.AccessToken == "" || d.Auth.RefreshToken == "" {
 		return nil, fmt.Errorf("auth file missing tokens")
 	}
-	am := &AuthManager{path: path, data: &d, client: newHTTPClient(30 * time.Second)}
+	am := &AuthManager{
+		path:         path,
+		data:         &d,
+		client:       newHTTPClient(30 * time.Second),
+		streamClient: newStreamingHTTPClient(),
+	}
 	am.uid = d.Account.UID
 	am.domain = d.Auth.Domain
 	if time.Now().UnixMilli() > d.Auth.ExpiresAt-60_000 {
@@ -316,6 +351,16 @@ func (a *AuthManager) headers() map[string]string {
 	return h
 }
 
+// clientFor picks the HTTP client for an upstream call. Streaming chat must not
+// use the fixed-timeout client: its deadline covers the whole exchange,
+// including reading the SSE body, and truncates long generations mid-stream.
+func (a *AuthManager) clientFor(path string, body []byte) *http.Client {
+	if path == "/v2/chat/completions" && a.streamClient != nil && bodyWantsStream(body) {
+		return a.streamClient
+	}
+	return a.client
+}
+
 func (a *AuthManager) doUpstream(method, path string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
 	u := upstreamBase + path
 	var rdr io.Reader
@@ -336,7 +381,7 @@ func (a *AuthManager) doUpstream(method, path string, body []byte, extraHeaders 
 	if req.Header.Get("X-Request-ID") == "" {
 		req.Header.Set("X-Request-ID", newRequestID())
 	}
-	return a.client.Do(req)
+	return a.clientFor(path, body).Do(req)
 }
 
 type refreshResponse struct {

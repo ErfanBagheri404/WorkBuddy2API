@@ -412,6 +412,67 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(respPayload)
 }
 
+// isDoneLine reports whether an SSE line is the [DONE] sentinel.
+func isDoneLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]"
+}
+
+// normalizeIntermediateFinishReason rewrites the non-standard
+// `"finish_reason": ""` that the upstream gateway puts on every intermediate
+// chunk to `null`, which is what the OpenAI schema specifies. Strict clients
+// reject the empty string. The rewrite is textual so the rest of the chunk
+// (ordering, omitting nothing) is preserved byte for byte.
+func normalizeIntermediateFinishReason(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") || !strings.Contains(line, `"finish_reason"`) {
+		return line
+	}
+	out := strings.ReplaceAll(line, `"finish_reason":""`, `"finish_reason":null`)
+	return strings.ReplaceAll(out, `"finish_reason": ""`, `"finish_reason": null`)
+}
+
+// writeTerminalChunk emits a final OpenAI chunk carrying finish_reason, then
+// the [DONE] sentinel. copySSELogged uses it when the upstream stream ends
+// without one (timeout, dropped connection, truncated body): an SSE body that
+// simply stops is invalid output for OpenAI-compatible clients, which report
+// "stream ended without finish_reason" and retry work that already produced
+// tokens.
+func writeTerminalChunk(dst io.Writer, flusher http.Flusher, model, finish string) {
+	chunk := map[string]any{
+		"id":      newRequestID(),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": finish,
+		}},
+	}
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return
+	}
+	// Leading blank line: the upstream event just forwarded may not have been
+	// terminated yet, and a stray blank line between events is harmless.
+	dst.Write([]byte("\ndata: " + string(payload) + "\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// writeDONE terminates the response with the [DONE] sentinel.
+func writeDONE(dst io.Writer, flusher http.Flusher) {
+	dst.Write([]byte("data: [DONE]\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
 // copySSELogged streams SSE to the client while capturing the raw upstream
 // stream for the trace file. Parses complete SSE data lines one at a time so
 // that a finish_reason split across two reads is not silently dropped.
@@ -424,10 +485,11 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 	var raw strings.Builder
 	finish := "stop"
 	chars := 0
+	sawTerminal := false
+	sawDone := false
 	scanner := bufio.NewScanner(src.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	for scanner.Scan() {
-		line := scanner.Text()
+	writeLine := func(line string) {
 		// Emit original line (without trailing newline, since Scan strips it).
 		dst.Write([]byte(line + "\n"))
 		if flusher != nil {
@@ -439,8 +501,33 @@ func copySSELogged(dst http.ResponseWriter, src *http.Response, cid, reqModel st
 			finish = finishReasonFromLine(line, finish)
 		}
 	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isDoneLine(line) {
+			if !sawTerminal {
+				writeTerminalChunk(dst, flusher, reqModel, "length")
+				sawTerminal = true
+			}
+			writeLine(line)
+			sawDone = true
+			// Anything after [DONE] belongs to no event the client will read.
+			break
+		}
+		if finishReasonFromLine(line, "") != "" {
+			sawTerminal = true
+		}
+		writeLine(normalizeIntermediateFinishReason(line))
+	}
 	if err := scanner.Err(); err != nil {
 		logLine(cid, "✗ UPSTREAM STREAM ERROR %s | %s", reqModel, err)
+	}
+	// Never let the response end on a bare EOF: synthesize the terminal chunk
+	// and sentinel the client needs to treat the turn as complete.
+	if !sawTerminal {
+		writeTerminalChunk(dst, flusher, reqModel, "length")
+	}
+	if !sawDone {
+		writeDONE(dst, flusher)
 	}
 	if LoggingEnabled() {
 		logLine(cid, "◀ RESPONSE %s | %.1fs | finish=%s | chars=%d (streamed)",
