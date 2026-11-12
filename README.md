@@ -176,14 +176,9 @@ list is fetched at runtime — nothing is baked into the binary.
 
 ## Releases
 
-Every push to `main` automatically:
+Every push to `main` automatically tags the merged commit with the next patch version and publishes a GitHub Release, with binaries for Windows, Linux and macOS attached and the commit log as release notes.
 
-1. bumps the patch version in `VERSION`,
-2. builds `WorkBuddy2API.exe` with the version stamped in,
-3. commits the bump, tags `vX.Y.Z`,
-4. publishes a GitHub Release with the binary attached and the commit log as notes.
-
-No manual tagging required. `ci.yml` runs `go vet` and a build on every push and pull request.
+The version is derived from the latest `vX.Y.Z` tag — the repository holds no version file, and the release workflow never commits to `main`, so branch protection requires no exceptions. A commit that is already tagged is never re-tagged, so re-running a failed workflow is safe. `ci.yml` runs `go vet` and a build on every push and pull request.
 
 ## Security
 
