@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -51,9 +53,10 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ needs.version.outputs.version }}"
+          version="$VERSION"
           name="${{ matrix.artifact }}"
           # strip suffix for non-exe builds
           go build -ldflags "-X main.Version=v${version}" -o "${name}" .
@@ -69,33 +72,43 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Sync to current main tip
+      - name: Sync tags
         run: |
           set -euo pipefail
-          git fetch origin main --tags --force
-          git reset --hard origin/main
+          git fetch origin --tags --force
 
       - name: Compute next version from tags
         id: bump
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           # Re-running a workflow for an already-tagged commit must not mint
-          # a new version.
-          if existing="$(git tag --points-at "$sha" --list 'v*' | head -n1)" && [ -n "$existing" ]; then
-            next="${existing#v}"
-            echo "HEAD already tagged ${existing}; reusing ${next}"
+          # a new version, and an existing tag must point at this commit.
+          existing="$(git tag --points-at "$sha" --list 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          latest="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          if [ -n "$existing" ]; then
+            next="$existing"
+            echo "HEAD already tagged v${existing}; reusing ${next}"
           else
-            latest="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo v0.0.0)"
-            current="${latest#v}"
+            if [ -z "$latest" ]; then
+              current="0.0.0"
+            else
+              current="$latest"
+            fi
             IFS='.' read -r major minor patch <<< "$current"
             next="${major}.${minor}.$((patch + 1))"
             echo "Next patch version: ${current} -> ${next}"
+          fi
+          if [[ ! "$next" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::computed version ${next} is not a release version"
+            exit 1
           fi
           echo "version=$next" >> "$GITHUB_OUTPUT"
 
@@ -106,6 +119,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.version.outputs.sha }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -122,15 +136,17 @@ jobs:
           ls release/
 
       - name: Build release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ needs.version.outputs.version }}"
-          prev="$(git describe --tags --abbrev=0 --match 'v*' --exclude "v${version}" 2>/dev/null || echo '')"
+          version="$VERSION"
+          prev="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | awk -v v="$version" '$0 < v' | tail -1)"
           {
             echo "## What changed"
             echo
             if [ -n "$prev" ]; then
-              git log --no-merges --pretty=format:"- %s (%h)" "${prev}..HEAD"
+              git log --no-merges --pretty=format:"- %s (%h)" "v${prev}..HEAD"
             else
               git log --no-merges --pretty=format:"- %s (%h)" HEAD
             fi
@@ -142,13 +158,20 @@ jobs:
           } > RELEASE_NOTES.md
 
       - name: Tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          version="${{ needs.version.outputs.version }}"
+          version="$VERSION"
           if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
-            echo "tag v${version} already exists; nothing to push"
+            tag_sha="$(git rev-parse "refs/tags/v${version}^{commit}")"
+            if [ "$tag_sha" != "$(git rev-parse HEAD)" ]; then
+              echo "::error::tag v${version} points at ${tag_sha}, not HEAD"
+              exit 1
+            fi
+            echo "tag v${version} already points at HEAD; nothing to push"
           else
             git tag "v${version}"
             git push origin "v${version}"
