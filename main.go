@@ -441,12 +441,11 @@ func startServer(authFile, apiKey string) {
 
 func runHeadless(apiKey string) {
 	authFile := defaultAuthPath()
-	am, err := LoadAuthManager(authFile)
+	client, am, err := newClientForAuth(authFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "auth error: %v\n", err)
 		os.Exit(1)
 	}
-	client := NewUpstreamClient(am)
 	srv := NewServer(client, am, apiKey, optDesensitize, newLimiter())
 	addr := ":61021"
 	fmt.Printf("WorkBuddy2API listening on http://localhost%s\n", addr)
