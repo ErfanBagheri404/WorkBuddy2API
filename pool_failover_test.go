@@ -15,6 +15,16 @@ import (
 	"time"
 )
 
+// setTestHome points os.UserHomeDir() at dir on every platform. Go reads $HOME
+// on unix, %USERPROFILE% on windows and $home on plan9; CI runs on
+// windows-latest, so setting only HOME silently tests the runner's real home.
+func setTestHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("home", dir)
+}
+
 // --- helpers ---------------------------------------------------------------
 
 type scriptedTransport struct {
@@ -240,6 +250,14 @@ func TestTryAccounts_ConcurrentFailoversUseIndependentOrders(t *testing.T) {
 
 // --- finding 1: pool is used even for a single / pinned account -------------
 
+func TestSetTestHome_RedirectsUserHomeDir(t *testing.T) {
+	dir := t.TempDir()
+	setTestHome(t, dir)
+	if got, err := os.UserHomeDir(); err != nil || got != dir {
+		t.Fatalf("os.UserHomeDir() = %q, %v; want %q (defaultAuthPath and DiscoverAccountPaths depend on it)", got, err, dir)
+	}
+}
+
 func TestNewClientForAuth_UsesPoolForSinglePinnedAccount(t *testing.T) {
 	dir := t.TempDir()
 	accountsDir := filepath.Join(dir, ".workbuddy2api", "accounts")
@@ -249,7 +267,7 @@ func TestNewClientForAuth_UsesPoolForSinglePinnedAccount(t *testing.T) {
 	// Only a pool account exists; there is deliberately NO default auth file.
 	writeAccount(t, accountsDir, "pinned.json")
 
-	t.Setenv("HOME", dir)
+	setTestHome(t, dir)
 	old := optAccount
 	optAccount = "pinned"
 	defer func() { optAccount = old }()
@@ -274,7 +292,7 @@ func TestNewClientForAuth_UsesPoolFileWhenDefaultAuthIsAbsent(t *testing.T) {
 	}
 	writeAccount(t, accountsDir, "only.json")
 
-	t.Setenv("HOME", dir)
+	setTestHome(t, dir)
 	old := optAccount
 	optAccount = ""
 	defer func() { optAccount = old }()
