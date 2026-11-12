@@ -245,18 +245,25 @@ func probeModel(client *UpstreamClient, uid, model string) {
 	if err != nil {
 		return
 	}
-	resp, err := client.chatWithOptions(context.Background(), body, chatOptions{skipReasoningFloor: true})
+	resp, am, err := client.chatWithOptions(context.Background(), body, chatOptions{skipReasoningFloor: true})
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
+	// Key the verdict to the account that actually answered. With a pool the
+	// probe may fail over to a different account than the one that started it,
+	// and model availability is per account.
+	servingUID := uid
+	if am != nil && am.UID() != "" {
+		servingUID = am.UID()
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		RecordModelVerdict(uid, model, modelStatusOK)
+		RecordModelVerdict(servingUID, model, modelStatusOK)
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	if verdict := ClassifyModelError(resp.StatusCode, raw); verdict != "" {
-		RecordModelVerdict(uid, model, verdict)
+		RecordModelVerdict(servingUID, model, verdict)
 	}
 }
 
