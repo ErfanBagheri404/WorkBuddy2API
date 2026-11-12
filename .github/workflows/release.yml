@@ -91,8 +91,16 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           # Re-running a workflow for an already-tagged commit must not mint
           # a new version, and an existing tag must point at this commit.
-          existing="$(git tag --points-at "$sha" --list 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
-          latest="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          tags_at_head="$(git tag --points-at "$sha" --list 'v*')" || {
+            echo "::error::failed to list tags at HEAD"
+            exit 1
+          }
+          existing="$(printf '%s\n' "$tags_at_head" | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          all_tags="$(git tag -l 'v*')" || {
+            echo "::error::failed to list tags"
+            exit 1
+          }
+          latest="$(printf '%s\n' "$all_tags" | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
           if [ -n "$existing" ]; then
             next="$existing"
             echo "HEAD already tagged v${existing}; reusing ${next}"
@@ -141,7 +149,11 @@ jobs:
         run: |
           set -euo pipefail
           version="$VERSION"
-          prev="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | awk -v v="$version" '$0 < v' | tail -1 || true)"
+          all_tags="$(git tag -l 'v*')" || {
+            echo "::error::failed to list tags"
+            exit 1
+          }
+          prev="$(printf '%s\n' "$all_tags" | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | awk -v v="$version" '$0 < v' | tail -1 || true)"
           {
             echo "## What changed"
             echo
