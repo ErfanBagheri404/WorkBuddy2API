@@ -82,6 +82,27 @@ func (p *AccountPool) Next() *AuthManager {
 	return p.accounts[idx].am
 }
 
+// Order returns a fresh rotation of every account for a single operation.
+// Each call advances the shared cursor once to pick a distinct starting
+// position, but the returned slice is a private copy: concurrent operations
+// walk their own copy instead of racing on p.idx between an attempt and its
+// retry. This keeps failover deterministic per request while still rotating
+// sequential traffic across accounts.
+func (p *AccountPool) Order() []*AuthManager {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := uint64(len(p.accounts))
+	if n == 0 {
+		return nil
+	}
+	start := p.idx.Add(1) % n
+	out := make([]*AuthManager, 0, n)
+	for i := uint64(0); i < n; i++ {
+		out = append(out, p.accounts[(start+i)%n].am)
+	}
+	return out
+}
+
 // Active returns the current account name (the one that would be used).
 func (p *AccountPool) Active() string {
 	p.mu.RLock()

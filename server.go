@@ -140,13 +140,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		s.handleModelByID(w, id)
 		return
 	}
-	models, err := GetModels(s.auth)
+	models, am, err := s.client.GetModelsFor()
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "fetch models: "+err.Error(), "server_error")
 		return
 	}
-	models = FilterUsableModels(s.auth.UID(), models)
-	MaybeProbeModels(s.client, s.auth.UID(), models)
+	uid := s.clientUID(am)
+	models = FilterUsableModels(uid, models)
+	MaybeProbeModels(s.client, uid, models)
 	now := time.Now().Unix()
 	list := make([]modelObject, 0, len(models))
 	for _, m := range models {
@@ -154,6 +155,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": list})
+}
+
+// clientUID returns the uid to key per-account state with. A pool-backed
+// operation reports the exact account that served it; for any operation that
+// has no such result (a cached list, for example), fall back to the current
+// primary account of the client.
+func (s *Server) clientUID(am *AuthManager) string {
+	if am != nil && am.UID() != "" {
+		return am.UID()
+	}
+	if s.client != nil {
+		if cur := s.client.currentAuth(); cur != nil {
+			return cur.UID()
+		}
+	}
+	if s.auth != nil {
+		return s.auth.UID()
+	}
+	return ""
 }
 
 // trimModelID returns the <id> segment of /v1/models/<id>, or "" when the path
@@ -172,12 +192,12 @@ func trimModelID(path string) string {
 
 // handleModelByID serves GET /v1/models/<id>.
 func (s *Server) handleModelByID(w http.ResponseWriter, id string) {
-	models, err := GetModels(s.auth)
+	models, am, err := s.client.GetModelsFor()
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "fetch models: "+err.Error(), "server_error")
 		return
 	}
-	models = FilterUsableModels(s.auth.UID(), models)
+	models = FilterUsableModels(s.clientUID(am), models)
 	for _, m := range models {
 		if m.ID == id {
 			w.Header().Set("Content-Type", "application/json")
@@ -251,7 +271,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	body, _ = json.Marshal(payload)
 
-	resp, err := s.client.Chat(r.Context(), body)
+	resp, am, err := s.client.Chat(r.Context(), body)
 	if err != nil {
 		logLine(cid, "✗ UPSTREAM ERROR %s | %s", reqModel, err)
 		writeError(w, http.StatusBadGateway, "upstream: "+err.Error(), "server_error")
@@ -264,7 +284,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		errBody, _ := io.ReadAll(resp.Body)
 		logLine(cid, "✗ UPSTREAM HTTP %d | %s", resp.StatusCode, redact(string(errBody)))
 		if verdict := ClassifyModelError(resp.StatusCode, errBody); verdict != "" {
-			RecordModelVerdict(s.auth.UID(), reqModel, verdict)
+			RecordModelVerdict(s.clientUID(am), reqModel, verdict)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
@@ -785,7 +805,7 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	logLine(cid, "▶ ANTHROPIC %s | max_tokens=%d | stream=%v",
 		ar.Model, ar.MaxTokens, ar.Stream == nil || *ar.Stream)
 
-	resp, err := s.client.Chat(r.Context(), openaiBody)
+	resp, am, err := s.client.Chat(r.Context(), openaiBody)
 	if err != nil {
 		logLine(cid, "✗ UPSTREAM ERROR %s | %s", ar.Model, err)
 		writeAnthropicError(w, http.StatusBadGateway, "upstream: "+err.Error(), "api_error")
@@ -797,7 +817,7 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 		errBody, _ := io.ReadAll(resp.Body)
 		logLine(cid, "✗ UPSTREAM HTTP %d", resp.StatusCode)
 		if verdict := ClassifyModelError(resp.StatusCode, errBody); verdict != "" {
-			RecordModelVerdict(s.auth.UID(), ar.Model, verdict)
+			RecordModelVerdict(s.clientUID(am), ar.Model, verdict)
 		}
 		writeAnthropicError(w, resp.StatusCode, string(errBody), "api_error")
 		return

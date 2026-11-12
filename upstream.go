@@ -58,18 +58,63 @@ var knownDirectModels = []CachedModel{
 	{ID: "deepseek-v3", Name: "DeepSeek-V3", Credits: "x0.00 credits", Free: true},
 }
 
-// FetchModels hits the upstream /v2/enterprises/personal/models endpoint
-// and appends the extra known direct names.
-func FetchModels(am *AuthManager) ([]CachedModel, error) {
-	resp, err := am.doUpstream(context.Background(), http.MethodGet, "/v2/enterprises/personal/models", nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("fetch models: %w", err)
+// tryAccounts walks a fixed account order for one operation, retrying on
+// quota/rate-limit responses and transport errors. It returns the response and
+// the exact account that served it, so callers can attribute per-account state
+// (model verdicts, probes) correctly. The order is local to this call: nothing
+// here mutates a shared cursor between the attempt and the retry, which is what
+// let concurrent requests collide on the same account before.
+func tryAccounts(order []*AuthManager, call func(*AuthManager) (*http.Response, error)) (*http.Response, *AuthManager, error) {
+	var lastErr error
+	var lastResp *http.Response
+	var lastAM *AuthManager
+	for _, am := range order {
+		resp, err := call(am)
+		if err != nil {
+			lastErr = err
+			lastAM = am
+			continue
+		}
+		// A 429/5xx can carry a quota marker in the body. Non-streaming
+		// responses are read fully here so failover can inspect them; streaming
+		// responses are returned immediately (SSE has already started).
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastResp = newHTTPResponse(resp, errBody)
+			lastAM = am
+			if IsQuotaError(resp.StatusCode, string(errBody)) {
+				continue
+			}
+			return lastResp, am, nil
+		}
+		return resp, am, nil
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read models response: %w", err)
+	if lastResp != nil {
+		return lastResp, lastAM, nil
 	}
+	if lastErr != nil {
+		if len(order) == 1 {
+			return nil, lastAM, lastErr
+		}
+		return nil, lastAM, fmt.Errorf("all accounts failed; last error: %w", lastErr)
+	}
+	return nil, lastAM, fmt.Errorf("no accounts available")
+}
+
+// accountOrder returns the accounts to try for one operation. A pool-backed
+// client gets its own fresh rotation; a single-account client always returns
+// its one account.
+func (c *UpstreamClient) accountOrder() []*AuthManager {
+	if c.pool != nil {
+		return c.pool.Order()
+	}
+	return []*AuthManager{c.auth}
+}
+
+// parseModels builds the model list from a raw upstream response body,
+// merging the installed desktop app's product.json and the known direct names.
+func parseModels(raw []byte) ([]CachedModel, error) {
 	var envelope struct {
 		Code int `json:"code"`
 		Data struct {
@@ -83,9 +128,6 @@ func FetchModels(am *AuthManager) ([]CachedModel, error) {
 		return nil, fmt.Errorf("models API error code=%d", envelope.Code)
 	}
 	models := envelope.Data.Models
-	// Merge names that aren't already present: the installed desktop app's
-	// product.json (adds every model WorkBuddy shipped but has not published
-	// to this endpoint yet) and the known direct names.
 	existing := make(map[string]bool, len(models))
 	for _, m := range models {
 		existing[m.ID] = true
@@ -102,8 +144,6 @@ func FetchModels(am *AuthManager) ([]CachedModel, error) {
 			models = append(models, em)
 		}
 	}
-	// Capability metadata (thinking model, free credits) only product.json
-	// carries; cloud values win where both sides have the field.
 	for i := range models {
 		if lm, ok := byID[models[i].ID]; ok {
 			models[i] = enrichFromLocal(models[i], lm)
@@ -116,11 +156,61 @@ func FetchModels(am *AuthManager) ([]CachedModel, error) {
 	if localPath != "" {
 		fmt.Printf("model catalog: %d from upstream, merged local product.json: %s\n", len(envelope.Data.Models), localPath)
 	}
+	return models, nil
+}
+
+// FetchModels hits the upstream /v2/enterprises/personal/models endpoint
+// and appends the extra known direct names.
+func FetchModels(am *AuthManager) ([]CachedModel, error) {
+	resp, err := am.doUpstream(context.Background(), http.MethodGet, "/v2/enterprises/personal/models", nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch models: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read models response: %w", err)
+	}
+	models, err := parseModels(raw)
+	if err != nil {
+		return nil, err
+	}
 	globalModelCache.mu.Lock()
 	globalModelCache.models = models
 	globalModelCache.fetched = time.Now()
 	globalModelCache.mu.Unlock()
 	return models, nil
+}
+
+// FetchModelsFor fetches the model list using the client's account pool when
+// one is present, failing over to the next account on a quota response, and
+// returns the account that supplied the list. Parsing happens only after
+// failover selects the successful response, and the shared cache is updated
+// once, with the winning account's data.
+func FetchModelsFor(c *UpstreamClient) ([]CachedModel, *AuthManager, error) {
+	resp, am, err := tryAccounts(c.accountOrder(), func(am *AuthManager) (*http.Response, error) {
+		return am.doUpstream(context.Background(), http.MethodGet, "/v2/enterprises/personal/models", nil, nil)
+	})
+	if err != nil {
+		return nil, am, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, am, fmt.Errorf("read models response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, am, fmt.Errorf("models HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
+	}
+	models, err := parseModels(raw)
+	if err != nil {
+		return nil, am, err
+	}
+	globalModelCache.mu.Lock()
+	globalModelCache.models = models
+	globalModelCache.fetched = time.Now()
+	globalModelCache.mu.Unlock()
+	return models, am, nil
 }
 
 // GetModels returns cached models or fetches if stale.
@@ -133,6 +223,21 @@ func GetModels(am *AuthManager) ([]CachedModel, error) {
 	}
 	globalModelCache.mu.RUnlock()
 	return FetchModels(am)
+}
+
+// GetModelsFor returns cached models (or fetches them via the pool) together
+// with the account that supplied them. A cached list is attributed to the pool's
+// current primary account; a fresh fetch uses the account that actually
+// answered, which is the one any model verdicts belong to.
+func (c *UpstreamClient) GetModelsFor() ([]CachedModel, *AuthManager, error) {
+	globalModelCache.mu.RLock()
+	if len(globalModelCache.models) > 0 && time.Since(globalModelCache.fetched) < 10*time.Minute {
+		models := globalModelCache.models
+		globalModelCache.mu.RUnlock()
+		return models, c.currentAuth(), nil
+	}
+	globalModelCache.mu.RUnlock()
+	return FetchModelsFor(c)
 }
 
 // ModelIDs returns just the ID strings.
@@ -169,13 +274,16 @@ func NewUpstreamClient(am *AuthManager) *UpstreamClient {
 }
 
 // NewUpstreamClientPool creates a client backed by an account pool for
-// round-robin selection and failover.
+// round-robin selection and failover. No single account is pinned into the
+// client: each operation gets its own rotation of the pool.
 func NewUpstreamClientPool(pool *AccountPool) *UpstreamClient {
-	return &UpstreamClient{auth: pool.Next(), pool: pool}
+	return &UpstreamClient{pool: pool}
 }
 
-// Chat forwards an OpenAI chat request to /v2/chat/completions.
-func (c *UpstreamClient) Chat(ctx context.Context, reqBody []byte) (*http.Response, error) {
+// Chat forwards an OpenAI chat request to /v2/chat/completions. It returns the
+// response and the account that served it, so the handler can attribute model
+// verdicts to the right account when a pool is in use.
+func (c *UpstreamClient) Chat(ctx context.Context, reqBody []byte) (*http.Response, *AuthManager, error) {
 	return c.chatWithOptions(ctx, reqBody, chatOptions{})
 }
 
@@ -188,10 +296,11 @@ type chatOptions struct {
 // chatWithOptions forwards an OpenAI chat request to /v2/chat/completions.
 // ctx is the incoming client request's context: when the caller disconnects,
 // the upstream request is cancelled so generation stops instead of running on.
-func (c *UpstreamClient) chatWithOptions(ctx context.Context, reqBody []byte, opts chatOptions) (*http.Response, error) {
+// It returns the response and the account that served it.
+func (c *UpstreamClient) chatWithOptions(ctx context.Context, reqBody []byte, opts chatOptions) (*http.Response, *AuthManager, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(reqBody, &payload); err != nil {
-		return nil, fmt.Errorf("invalid request JSON: %w", err)
+		return nil, nil, fmt.Errorf("invalid request JSON: %w", err)
 	}
 
 	// stream defaults to true
@@ -202,7 +311,7 @@ func (c *UpstreamClient) chatWithOptions(ctx context.Context, reqBody []byte, op
 	// Ensure first message is system
 	msgs, _ := payload["messages"].([]any)
 	if len(msgs) == 0 {
-		return nil, fmt.Errorf("messages must not be empty")
+		return nil, nil, fmt.Errorf("messages must not be empty")
 	}
 	first, _ := msgs[0].(map[string]any)
 	role, _ := first["role"].(string)
@@ -224,7 +333,7 @@ func (c *UpstreamClient) chatWithOptions(ctx context.Context, reqBody []byte, op
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	stream, _ := payload["stream"].(bool)
@@ -292,70 +401,30 @@ func (c *UpstreamClient) chatWithOptions(ctx context.Context, reqBody []byte, op
 		"X-Request-ID":                 msgID,
 	}
 
-	resp, err := c.doWithFailover(ctx, http.MethodPost, "/v2/chat/completions", body, extraHeaders)
+	resp, am, err := c.doWithFailover(ctx, http.MethodPost, "/v2/chat/completions", body, extraHeaders)
 	if err != nil {
-		return nil, fmt.Errorf("upstream request: %w", err)
+		return nil, am, fmt.Errorf("upstream request: %w", err)
 	}
-	return resp, nil
+	return resp, am, nil
 }
 
-// doWithFailover posts to upstream. With a pool and quota errors, it retries
-// on subsequent accounts. Non-streaming responses are read fully so failover
-// can inspect the body; streaming responses are returned immediately (SSE has
-// already started, so the response status can still signal quota errors).
-func (c *UpstreamClient) doWithFailover(ctx context.Context, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
-	var lastErr error
-	var lastResp *http.Response
-	// Try the current account, then up to (count-1) more.
-	attempts := 1
-	if c.pool != nil {
-		attempts = c.pool.Count()
-	}
-	for i := 0; i < attempts; i++ {
-		am := c.currentAuth()
-		resp, err := am.doUpstream(ctx, method, path, body, headers)
-		if err != nil {
-			lastErr = err
-			if c.pool != nil {
-				c.advance()
-				continue
-			}
-			return nil, err
-		}
-		// A 429 with an empty stream body is a quota/rate-limit signal.
-		// Non-stream: check body for quota markers.
-		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastResp = newHTTPResponse(resp, errBody)
-			if c.pool != nil && IsQuotaError(resp.StatusCode, string(errBody)) {
-				c.advance()
-				continue
-			}
-			// No pool or not a quota error: surface it.
-			return newHTTPResponse(resp, errBody), nil
-		}
-		return resp, nil
-	}
-	if lastResp != nil {
-		return lastResp, nil
-	}
-	return nil, fmt.Errorf("all accounts failed; last error: %w", lastErr)
+// doWithFailover posts to upstream. It walks a per-operation rotation of the
+// pool (or the single account), retrying on quota/rate-limit responses and
+// transport errors, and returns the account that produced the final result.
+func (c *UpstreamClient) doWithFailover(ctx context.Context, method, path string, body []byte, headers map[string]string) (*http.Response, *AuthManager, error) {
+	return tryAccounts(c.accountOrder(), func(am *AuthManager) (*http.Response, error) {
+		return am.doUpstream(ctx, method, path, body, headers)
+	})
 }
 
-// currentAuth returns the auth manager for the current pool position
-// without advancing. The caller must call advance() separately.
+// currentAuth returns the pool's current primary account (or the single
+// account). Used only to attribute cached state; request failover uses
+// accountOrder so it never depends on this shared cursor.
 func (c *UpstreamClient) currentAuth() *AuthManager {
 	if c.pool != nil {
 		return c.pool.Peek()
 	}
 	return c.auth
-}
-
-func (c *UpstreamClient) advance() {
-	if c.pool != nil {
-		c.pool.Next()
-	}
 }
 
 // newHTTPResponse rebuilds an *http.Response with the body already read,

@@ -387,19 +387,22 @@ func testChat(authFile string) {
 	fmt.Println()
 }
 
-// newClientForAuth builds the upstream client for a server run. When multiple
-// account files exist under ~/.workbuddy2api/accounts/, it returns a
-// pool-backed client with round-robin selection and quota failover; otherwise
-// it falls back to the single-account client.
+// newClientForAuth builds the upstream client for a server run. Any valid
+// account file — the ones under ~/.workbuddy2api/accounts/, a pinned
+// --account selection, or the default auth file — is loaded into a pool, so
+// headless and interactive modes behave identically and a single pinned
+// account is honoured even when the default auth file is absent. The
+// single-account client is used only when no pool account could be loaded.
 func newClientForAuth(authFile string) (*UpstreamClient, *AuthManager, error) {
 	pool, perr := LoadAccountPool(optAccount)
-	if perr == nil && pool.Count() > 1 {
-		fmt.Printf("  Accounts: %d (%s)\n", pool.Count(), strings.Join(pool.All(), ", "))
+	if perr == nil {
+		if pool.Count() > 1 {
+			fmt.Printf("  Accounts: %d (%s)\n", pool.Count(), strings.Join(pool.All(), ", "))
+		}
 		if optAccount != "" {
 			fmt.Printf("  Pinned to: %s\n", optAccount)
 		}
-		am := pool.Peek()
-		return NewUpstreamClientPool(pool), am, nil
+		return NewUpstreamClientPool(pool), pool.Peek(), nil
 	}
 	am, err := LoadAuthManager(authFile)
 	if err != nil {
